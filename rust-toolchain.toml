@@ -1,0 +1,6 @@
+# Pinned so two rebuilds months apart behave identically with the same repo
+# contents. An unpinned `cargo build` is the same reproducibility hole as an
+# unpinned Ansible collection version.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
