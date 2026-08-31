@@ -73,6 +73,13 @@ async fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("repo stopped before it could accept connections"))?;
 
     let app = Router::new()
+        // The websocket lives at BOTH the root and /sync, and the root is the one
+        // that matters. `automerge-repo`'s WebSocketClientAdapter connects to
+        // exactly the URL it is given and appends no path, and the reference
+        // sync server serves at the root — so clients are configured with a bare
+        // `ws://host:port`. Serving only /sync means a stock client gets a 404
+        // instead of an upgrade, which surfaces as "sync silently never works".
+        .route("/", get(sync))
         .route("/sync", get(sync))
         .route("/health", get(health))
         .with_state(AppState {

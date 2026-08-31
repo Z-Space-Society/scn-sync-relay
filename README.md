@@ -43,7 +43,8 @@ All settings come from the environment; systemd loads them from an
 
 | Path | Purpose |
 | --- | --- |
-| `GET /sync` | WebSocket upgrade; the automerge-repo sync protocol |
+| `GET /` | WebSocket upgrade; the automerge-repo sync protocol. **This is the one clients use** — `WebSocketClientAdapter` connects to exactly the URL it is given and appends no path, and the reference sync server serves at the root, so clients are configured with a bare `ws://host:port`. |
+| `GET /sync` | The same handler, for a client configured with an explicit path. |
 | `GET /health` | Liveness and the current auth mode. Does not touch Postgres, so a database blip cannot get the relay restarted out from under live connections. |
 
 ## Storage
