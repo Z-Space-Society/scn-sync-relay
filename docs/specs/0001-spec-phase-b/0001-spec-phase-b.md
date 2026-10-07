@@ -20,6 +20,9 @@ when you are not.
 - Sharing a vault between members. Each vault has one owner.
 - ATProto service-auth verification. The verifier seam keeps room for it.
 - Deleting notes through MCP.
+- A server-side markdown exporter. The `.md` files are written by the plugin
+  on each device.
+- Removing a deleted note's stored document. See Z4.
 - End-to-end encryption. The relay can read every document.
 - Compaction of document history.
 
@@ -126,8 +129,13 @@ every MCP tool. It answers true when either holds:
 - `doc_creators` records `did` as the document's creator and the document is
   not in any vault's reachable set.
 
-The second case covers the moment between a client creating a note and
-linking it into a folder document.
+The second case covers three states: a note created and not yet linked into
+a folder document, a note part way through a move between folders, and a note
+whose entry was deleted. In all three the creator can still sync the
+document, and no path leads to it.
+
+Both cases are answered from memory (Z2, Z4). `may_open` makes no database
+call.
 
 When sharing arrives, only the backing of this function changes.
 
@@ -141,7 +149,8 @@ CREATE TABLE vaults (
   root_doc_id TEXT PRIMARY KEY,
   owner_did   TEXT NOT NULL,
   name        TEXT NOT NULL,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_change_at TIMESTAMPTZ
 );
 CREATE INDEX vaults_owner ON vaults (owner_did);
 
@@ -158,6 +167,11 @@ the MCP `create_note` tool. The write is
 `INSERT ... ON CONFLICT DO NOTHING`, then read back, so two peers racing on
 one ID cannot both become its creator.
 
+The relay loads `doc_creators` into memory at startup and writes through to
+the table. "Unknown to the relay" in Z5 means no entry in that map, so the
+filter touches the database only on a document's first frame. Each new row is
+also passed to the reachability index (Z4).
+
 ### Z3. Vault endpoints
 
 On the sync listener. Member endpoints take a bearer token with the sync
@@ -172,6 +186,14 @@ audience.
 The `/internal/` prefix exists so the reverse proxy can leave it unrouted.
 It is reachable only on the internal network.
 
+A client registers a vault after its root document's first sync frame has
+reached the relay. Until then `POST /vaults` answers `409`, and the client
+retries.
+
+Last change comes from `DocHandle::changes` on the vault's documents. It is
+held in memory and written to `vaults.last_change_at` at most once a minute
+per vault, never per edit.
+
 ### Z4. Reachability index
 
 For each vault, the set of document IDs reachable from its root by walking
@@ -181,13 +203,24 @@ folder documents. Folder documents list entries shaped `{name, type, url}`.
 - Built at startup for every row in `vaults`, and when a vault is
   registered.
 - Rebuilt for a vault when any of its folder documents changes
-  (`DocHandle::changes`).
+  (`DocHandle::changes`), at most once a second per vault. A first import
+  changes folder documents thousands of times.
+- A document linked from two folders of one vault is in the set once. That
+  is the normal state part way through a move, because clients add the new
+  entry before removing the old one.
+- Leaving the set removes a document from path lookups and from search (M4).
+  It does not deny the owner, who is still its creator (Z1), and the stored
+  document is kept.
 - Derived and rebuildable. Never authoritative, never persisted.
 
 **Admission rule.** A document enters a vault's reachable set only if
 `doc_creators` names the vault's owner as its creator. Without this, a member
 could gain access to someone else's document by adding its URL to their own
-folder document. A link that fails the rule is ignored and logged.
+folder document. A link to a document created by someone else is ignored and
+logged. A link to a document with no `doc_creators` row yet is held as
+pending and not logged, because a folder change can arrive before the linked
+note's first frame. When the row is written, the pending link is checked
+again.
 
 ### Z5. Transport filter
 
@@ -223,6 +256,9 @@ The repo is built with `NeverAnnounce`. The relay never offers a document
 unasked and never asks one peer for a document on behalf of another. Clients
 request the documents their folder documents list. A change still reaches
 every peer that has already synced that document.
+
+A client therefore requests every document it wants changes for, on every
+connection. See open question 7.
 
 ## MCP service
 
@@ -264,6 +300,10 @@ Nothing here is specific to one MCP client.
 Every tool acts as the caller's DID and calls `may_open` on every document
 it touches.
 
+Tools address a note by vault and path, resolved through the folder
+documents at call time. A note with no folder entry cannot be reached by any
+tool. `create_note` refuses a path that already has an entry.
+
 | Tool | Does |
 |---|---|
 | `list_vaults` | The caller's vaults |
@@ -280,7 +320,10 @@ Writes are targeted text edits. No tool replaces a whole document. Tools use
 ### M4. Search
 
 An in-memory index per vault, built on the first search of that vault and
-kept current from `DocHandle::changes`. Dropped on restart.
+dropped on restart. A note's text is reindexed from `DocHandle::changes`, at
+most once a second per note. Which notes are in the index, and their paths,
+follow the reachability index, so a deleted note leaves the index and a moved
+or renamed note is returned at its new path.
 
 ## Configuration
 
@@ -323,7 +366,10 @@ Unit tests:
 - `filter`: allow, deny with `doc-unavailable`, new document recorded,
   outbound drop, close at expiry.
 - `authz` and `reach`: owner allowed, other member denied, unlinked document
-  allowed only to its creator, foreign link ignored by the admission rule.
+  allowed only to its creator, foreign link ignored by the admission rule; a
+  note linked from two folders; a note whose entry is removed stays open to
+  its creator and is absent from tools and search; a link that arrives before
+  the note's first frame is admitted once the creator row is written.
 - `auth`: good token, expired, wrong audience, wrong issuer, unknown `kid`
   triggering one refetch.
 
@@ -339,15 +385,16 @@ relay's router:
 | 5. An MCP edit reaches a sync client and a sync edit is visible to MCP | One client connected, edit each way |
 | 6. A restart loses nothing, including vault records | Rebuild the app on the same database |
 
-Checks 4 and 5 against real MCP clients and the mobile app are verified on
-the deployed relay, not in this repo's tests.
+Checks 4 and 5 against real MCP clients and Obsidian on iOS with the
+scn-obsidian plugin are verified on the deployed relay, not in this repo's
+tests.
 
 ## Open questions
 
 1. **Folder and note document schema.** The entry shape `{name, type, url}`
    is fixed. The key that holds the entries, and the key that holds a note's
-   text, are set by the client and need pinning before `reach.rs` and the
-   tools are written.
+   text, are settled in the scn-obsidian plugin spec, because the plugin
+   writes them, and then copied here. `reach.rs` and the tools wait on that.
 2. **Client reaction to `doc-unavailable` on a denied push.** Not verified
    against the JS client. It decides whether a denied write fails quietly or
    surfaces an error.
@@ -367,6 +414,15 @@ the deployed relay, not in this repo's tests.
 6. **Upstream.** samod's issue tracker was not checked for planned
    access-control hooks. If one lands, the inbound half of the filter could
    move into it.
+7. **Reconnect cost.** Access tokens last 15 minutes and the relay closes
+   each connection at `exp` (A3). The relay never announces (Z6), so on every
+   reconnect the client starts sync for every document it holds. For a vault
+   of N notes that is N handshakes per device every 15 minutes, and samod
+   keeps each requested document loaded. Measure on the deployed relay with a
+   real vault: handshake time, relay memory, and Postgres reads per
+   reconnect. If the cost is too high, the candidates are a longer sync token
+   lifetime or renewing a token on an open connection. Neither is designed
+   here.
 
 ## Rollout
 
