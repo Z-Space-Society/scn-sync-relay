@@ -1,0 +1,362 @@
+# 0001 Spec: Phase B (auth, owner-only authorization, MCP)
+
+Status: draft, 2026-10-07.
+
+## Goal
+
+Make the relay safe to carry members' real notes and reachable from outside
+the cluster.
+
+1. Every connection is authenticated as an SCN member's DID.
+2. A member can open only documents in their own vaults.
+3. A built-in MCP service lets an MCP client read and edit a member's notes,
+   acting as that member.
+
+The rule for all three: access works while you are an SCN member and stops
+when you are not.
+
+## Non-goals
+
+- Sharing a vault between members. Each vault has one owner.
+- ATProto service-auth verification. The verifier seam keeps room for it.
+- Deleting notes through MCP.
+- End-to-end encryption. The relay can read every document.
+- Compaction of document history.
+
+## Current state (v0.1.2)
+
+- samod 0.15 over axum 0.8, storing through sqlx 0.9 to one Postgres
+  key/value table
+  (`src/storage.rs`).
+- Websocket at `/` and `/sync`, liveness at `/health` (`src/main.rs:82-84`).
+- No authentication. `build_verifier` returns `AllowAll` or refuses to start
+  (`src/main.rs:121-130`). `sync()` calls `verify(None)` and never reads the
+  URL (`src/main.rs:146`). It accepts the socket with no expected peer ID
+  (`src/main.rs:161`).
+- No authorization. samod's default announce policy offers every loaded
+  document to every peer.
+- No documents. The relay has never held content, so Phase B starts on an
+  empty `storage` table and there is nothing to migrate or assign an owner.
+
+## What samod does and does not enforce
+
+Read from samod and samod-core 0.15.0 source.
+
+- `AnnouncePolicy::should_announce(DocumentId, PeerId)` is samod's only
+  policy hook. It decides whether the relay offers a document first.
+- It does not gate inbound messages. A peer that sends a `request` or `sync`
+  for a document ID gets the document and can write to it, whatever the
+  policy says (samod-core `src/actors/document/phase/ready.rs:29-66`).
+- A message for an unknown document ID creates that document on the relay
+  (samod-core `src/actors/hub/state.rs:731-744`). There is no hook for it.
+- The peer ID is whatever the client declares in its handshake, unless the
+  transport is given an expected one.
+- samod has no public call to close one connection.
+
+Authorization therefore cannot live inside samod. It lives in a filter on
+each connection's transport, described below.
+
+## Dependency changes
+
+| Crate | Change | Why |
+|---|---|---|
+| `automerge` | add, matching samod's version | Text edits and folder document reads in the MCP tools |
+| `rmcp` | add, 3.x, features `server`, `macros`, `transport-streamable-http-server` | MCP Streamable HTTP server as a tower service |
+| `jsonwebtoken` | add | Verify RS256 access tokens |
+| `reqwest` | add, rustls | Fetch the issuer's JWKS |
+| `minicbor` | add | Read the sync protocol's message envelope |
+| `serde`, `serde_json` | add | Tokens, endpoints, tool arguments |
+
+rmcp needs Rust 1.88. `rust-version` in `Cargo.toml` is already 1.94, set by
+sqlx 0.9.
+
+## Authentication
+
+### A1. Corliss token verifier
+
+`CorlissVerifier` implements the existing `DidVerifier` trait
+(`src/auth.rs:53`).
+
+- Fetch the issuer's JWKS at startup and cache it. On a token whose `kid` is
+  not in the cache, refetch once, with a floor on how often that can happen.
+- Accept RS256 only.
+- Check signature, `iss`, `exp`, and `aud`. The expected audience is passed
+  in by the caller, because sync and MCP have different audiences.
+- Return `Did(sub)` and the expiry time. The trait's return type grows to
+  carry the expiry.
+- Reject a `sub` that is not a DID.
+
+`build_verifier` selects `CorlissVerifier` when `REQUIRE_AUTH` is true. If
+the issuer or audience settings are missing, the relay refuses to start. With
+`REQUIRE_AUTH=false` it keeps today's `AllowAll` behaviour for local work,
+and the filter below is not installed.
+
+A second verifier for ATProto service auth can be added behind the same
+trait later. Everything past the verifier sees only a DID.
+
+### A2. Token in the URL for sync
+
+Browser and mobile websockets cannot set an `Authorization` header. The
+client connects to `wss://<sync host>/?access_token=<jwt>`.
+
+- `sync()` reads `access_token` from the query string and passes it to
+  `verify()`.
+- A missing, expired, wrong-audience or otherwise invalid token gets `401`
+  before the upgrade. The response body does not say why.
+- The token and the query string are never logged.
+
+### A3. Close at token expiry
+
+The transport filter ends the connection when the token's `exp` passes. The
+client reconnects with a fresh token. A member removed from the network
+loses sync within one token lifetime.
+
+## Authorization
+
+### Z1. One function
+
+```rust
+async fn may_open(&self, did: &Did, doc: &DocumentId) -> bool
+```
+
+Every check goes through it: inbound sync frames, outbound sync frames, and
+every MCP tool. It answers true when either holds:
+
+- the document is in the reachable set of a vault owned by `did`, or
+- `doc_creators` records `did` as the document's creator and the document is
+  not in any vault's reachable set.
+
+The second case covers the moment between a client creating a note and
+linking it into a folder document.
+
+When sharing arrives, only the backing of this function changes.
+
+### Z2. Ownership records
+
+Two tables beside `storage`, created at startup the same way
+(`CREATE TABLE IF NOT EXISTS`):
+
+```sql
+CREATE TABLE vaults (
+  root_doc_id TEXT PRIMARY KEY,
+  owner_did   TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX vaults_owner ON vaults (owner_did);
+
+CREATE TABLE doc_creators (
+  doc_id      TEXT PRIMARY KEY,
+  creator_did TEXT NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+`doc_creators` is written in two places: by the inbound filter the first
+time an authenticated peer sends a frame for an unknown document ID, and by
+the MCP `create_note` tool. The write is
+`INSERT ... ON CONFLICT DO NOTHING`, then read back, so two peers racing on
+one ID cannot both become its creator.
+
+### Z3. Vault endpoints
+
+On the sync listener. Member endpoints take a bearer token with the sync
+audience.
+
+| Endpoint | Caller | Does |
+|---|---|---|
+| `POST /vaults` `{root_doc_id, name}` | member | Registers a vault owned by the caller. Requires that `doc_creators` names the caller as creator of `root_doc_id` and that the document is not already in a vault. `409` otherwise. |
+| `GET /vaults` | member | Lists the caller's vaults. |
+| `GET /internal/vaults?did=<did>` | Corliss | Lists a member's vaults: name, created, last change. Authenticated with a shared service credential. |
+
+The `/internal/` prefix exists so the reverse proxy can leave it unrouted.
+It is reachable only on the internal network.
+
+### Z4. Reachability index
+
+For each vault, the set of document IDs reachable from its root by walking
+folder documents. Folder documents list entries shaped `{name, type, url}`.
+
+- Held in memory: `doc_id -> root_doc_id`.
+- Built at startup for every row in `vaults`, and when a vault is
+  registered.
+- Rebuilt for a vault when any of its folder documents changes
+  (`DocHandle::changes`).
+- Derived and rebuildable. Never authoritative, never persisted.
+
+**Admission rule.** A document enters a vault's reachable set only if
+`doc_creators` names the vault's owner as its creator. Without this, a member
+could gain access to someone else's document by adding its URL to their own
+folder document. A link that fails the rule is ignored and logged.
+
+### Z5. Transport filter
+
+`handle_socket` stops calling `accept_axum`. It builds a
+`samod::Transport` from the websocket itself and wraps both directions,
+then calls `AcceptorHandle::accept`. The filter holds the connection's DID
+and token expiry.
+
+Envelope. Each frame is a CBOR map with string keys. The filter reads
+`type`, `senderId` and `documentId` and leaves the rest untouched.
+
+Inbound, by `type`:
+
+| Type | Action |
+|---|---|
+| `join`, `leave`, `error` | Pass |
+| `request`, `sync`, `ephemeral`, `doc-unavailable` | If the document is unknown to the relay, record the creator (Z2). Then `may_open`. Pass if true. If false, drop the frame and send `doc-unavailable` for that document back to the peer. |
+| `remote-subscription-change`, `remote-heads-changed` | Drop |
+| Unparseable, or any other type | Drop and log at warn |
+
+Outbound: frames carrying a `documentId` pass only if `may_open` is true.
+Others pass. This is a second wall behind the inbound check.
+
+A denied document and a document that does not exist look the same to the
+peer.
+
+Expiry: at the token's `exp` the filter sends a websocket close and ends the
+inbound stream, which makes samod drop the connection.
+
+### Z6. Announce policy
+
+The repo is built with `NeverAnnounce`. The relay never offers a document
+unasked and never asks one peer for a document on behalf of another. Clients
+request the documents their folder documents list. A change still reaches
+every peer that has already synced that document.
+
+## MCP service
+
+### M1. Shape
+
+- Same process and same `samod::Repo` as sync. Tools read and edit the live
+  documents, and edits reach connected peers through samod's normal sync.
+- Its own listener, so sync and MCP traffic stay separate in the proxy and in
+  logs.
+- `rmcp`'s `StreamableHttpService`, mounted on an axum router.
+- `allowed_hosts` set to the public MCP host. rmcp's default accepts only
+  loopback and answers `403` to anything else.
+- Stateless: no server-side sessions. Each request carries its own token.
+
+### M2. OAuth handshake
+
+- `GET /.well-known/oauth-protected-resource` returns `resource` (the exact
+  public MCP URL) and `authorization_servers` (the issuer).
+- An axum middleware in front of the MCP service verifies the bearer token
+  with `CorlissVerifier`, using the MCP audience.
+- No token or a bad token: `401` with
+  `WWW-Authenticate: Bearer resource_metadata="<public MCP URL>/.well-known/oauth-protected-resource"`.
+- On success the middleware stores the `Did` in the request's extensions.
+  rmcp passes the request parts to tool handlers, which read the `Did` from
+  there. Tools never see the token.
+
+Nothing here is specific to one MCP client.
+
+### M3. Tools
+
+Every tool acts as the caller's DID and calls `may_open` on every document
+it touches.
+
+| Tool | Does |
+|---|---|
+| `list_vaults` | The caller's vaults |
+| `list_notes` | Notes and folders under a path in a vault |
+| `read_note` | A note's markdown |
+| `search_notes` | Text search across one vault |
+| `create_note` | New note at a path. Creates the document, records the creator, adds the entry to the folder document. |
+| `edit_note` | Find and replace, applied as text splices |
+| `append_note` | Append text to a note |
+
+Writes are targeted text edits. No tool replaces a whole document. Tools use
+`DocHandle::with_document_async` so a slow edit does not block the runtime.
+
+### M4. Search
+
+An in-memory index per vault, built on the first search of that vault and
+kept current from `DocHandle::changes`. Dropped on restart.
+
+## Configuration
+
+All prefixed `SCN_SYNC_RELAY_`.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DATABASE_URL` | required | Unchanged |
+| `BIND` | `0.0.0.0:7030` | Unchanged. Sync and vault endpoints. |
+| `REQUIRE_AUTH` | `true` | Now runnable when true |
+| `OIDC_ISSUER` | required when auth is on | Expected `iss` |
+| `OIDC_JWKS_URL` | required when auth is on | |
+| `SYNC_AUDIENCE` | required when auth is on | Public sync URL |
+| `MCP_BIND` | `0.0.0.0:7031` | MCP listener |
+| `MCP_AUDIENCE` | required when auth is on | Public MCP URL. Also the `resource` value and the source of `allowed_hosts`. |
+| `SERVICE_TOKEN` | required when auth is on | Shared credential for `/internal/vaults` |
+
+`/health` keeps reporting the auth mode, which becomes `corliss` when the
+verifier is active.
+
+## Module layout
+
+| File | Holds |
+|---|---|
+| `src/auth.rs` | `DidVerifier`, `AllowAll`, `CorlissVerifier`, JWKS cache |
+| `src/authz.rs` | `may_open`, `vaults` and `doc_creators` queries |
+| `src/reach.rs` | Reachability index and the folder document walk |
+| `src/wire.rs` | CBOR envelope reader, `doc-unavailable` writer |
+| `src/filter.rs` | Transport filter and expiry |
+| `src/vaults.rs` | `/vaults` and `/internal/vaults` handlers |
+| `src/mcp/` | Server setup, auth middleware, tools, search |
+| `src/config.rs` | New settings |
+| `src/main.rs` | Wiring, two listeners |
+
+## Test plan
+
+Unit tests:
+
+- `wire`: round trip against frames produced by samod; unparseable input.
+- `filter`: allow, deny with `doc-unavailable`, new document recorded,
+  outbound drop, close at expiry.
+- `authz` and `reach`: owner allowed, other member denied, unlinked document
+  allowed only to its creator, foreign link ignored by the admission rule.
+- `auth`: good token, expired, wrong audience, wrong issuer, unknown `kid`
+  triggering one refetch.
+
+Integration tests, with a second samod repo acting as the client against the
+relay's router:
+
+| Acceptance check | Test |
+|---|---|
+| 1. No token, expired token or wrong audience gets `401` before upgrade | HTTP requests against `/` |
+| 2. Member A cannot open or learn of member B's documents, by sync or MCP | Client as A requests B's document ID and gets unavailable; MCP tools as A return not found; no outbound frame for B's documents reaches A |
+| 3. A connection closes at token expiry | Short-lived token, assert the socket closes |
+| 4. An MCP client can list, read, search and edit | Tool calls over Streamable HTTP |
+| 5. An MCP edit reaches a sync client and a sync edit is visible to MCP | One client connected, edit each way |
+| 6. A restart loses nothing, including vault records | Rebuild the app on the same database |
+
+Checks 4 and 5 against real MCP clients and the mobile app are verified on
+the deployed relay, not in this repo's tests.
+
+## Open questions
+
+1. **Folder and note document schema.** The entry shape `{name, type, url}`
+   is fixed. The key that holds the entries, and the key that holds a note's
+   text, are set by the client and need pinning before `reach.rs` and the
+   tools are written.
+2. **Client reaction to `doc-unavailable` on a denied push.** Not verified
+   against the JS client. It decides whether a denied write fails quietly or
+   surfaces an error.
+3. **MCP session mode.** Stateless is proposed. Not verified against the
+   hosted MCP clients this must serve.
+4. **`/internal/vaults` path.** A separate path so the proxy can leave it
+   unrouted, in place of a `did` parameter on the public `/vaults`. Confirm.
+5. **Bulk edits by a model.** No rate limit or proposal step in this spec.
+   Decide before the first incident.
+6. **Upstream.** samod's issue tracker was not checked for planned
+   access-control hooks. If one lands, the inbound half of the filter could
+   move into it.
+
+## Rollout
+
+1. Land in this repo, bump the version, push an annotated tag.
+2. In the deployment repo: new env vars, the MCP port, `REQUIRE_AUTH=true`,
+   and the two public routes, in the same change. Query strings stripped from
+   proxy access logs.
+3. Update this repo's README: status, configuration table, endpoints.
