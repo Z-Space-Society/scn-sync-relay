@@ -156,7 +156,9 @@ async fn sync(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoR
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState, did: String) {
-    match state.acceptor.accept_axum(socket) {
+    // No expected peer ID: Phase A authenticates nobody, so there is no
+    // identity to bind the handshake to and samod trusts the one it is told.
+    match state.acceptor.accept_axum(socket, None) {
         Ok(_conn) => {
             // samod drives the connection on its own task, so there is nothing
             // to hold here. Dropping the handle does not close the socket.

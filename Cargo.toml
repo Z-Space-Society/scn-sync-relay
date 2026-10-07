@@ -1,6 +1,6 @@
 [package]
 name = "scn-sync-relay"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -8,7 +8,7 @@ description = "Automerge sync relay for the Shared Computer Network"
 repository = "https://github.com/Z-Space-Society/scn-sync-relay"
 
 [dependencies]
-samod = { version = "0.13", features = ["tokio", "axum"] }
+samod = { version = "0.15", features = ["tokio", "axum"] }
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
 sqlx = { version = "0.8", default-features = false, features = [
