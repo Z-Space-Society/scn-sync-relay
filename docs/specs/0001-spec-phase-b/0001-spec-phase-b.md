@@ -235,16 +235,24 @@ every peer that has already synced that document.
 - `rmcp`'s `StreamableHttpService`, mounted on an axum router.
 - `allowed_hosts` set to the public MCP host. rmcp's default accepts only
   loopback and answers `403` to anything else.
-- Stateless: no server-side sessions. Each request carries its own token.
+- Stateless: `legacy_session_mode: false`. No session ID is issued, and GET
+  and DELETE answer `405`. Each request carries its own token.
+- `json_response: true`. A tool call returns one JSON body. rmcp falls back to
+  an SSE response only if a handler emits a notification before its result,
+  which no tool here does.
+- Tools never push unprompted and should return within 60 seconds, the
+  shortest first-byte timeout among the clients served.
 
 ### M2. OAuth handshake
 
-- `GET /.well-known/oauth-protected-resource` returns `resource` (the exact
-  public MCP URL) and `authorization_servers` (the issuer).
+- `GET /.well-known/oauth-protected-resource<MCP path>` on the MCP host
+  returns `resource` (the public MCP URL in canonical form: lowercase scheme
+  and host, no trailing slash, no default port) and `authorization_servers`
+  (the issuer).
 - An axum middleware in front of the MCP service verifies the bearer token
   with `CorlissVerifier`, using the MCP audience.
 - No token or a bad token: `401` with
-  `WWW-Authenticate: Bearer resource_metadata="<public MCP URL>/.well-known/oauth-protected-resource"`.
+  `WWW-Authenticate: Bearer resource_metadata="https://<MCP host>/.well-known/oauth-protected-resource<MCP path>"`.
 - On success the middleware stores the `Did` in the request's extensions.
   rmcp passes the request parts to tool handlers, which read the `Did` from
   there. Tools never see the token.
@@ -287,7 +295,7 @@ All prefixed `SCN_SYNC_RELAY_`.
 | `OIDC_JWKS_URL` | required when auth is on | |
 | `SYNC_AUDIENCE` | required when auth is on | Public sync URL |
 | `MCP_BIND` | `0.0.0.0:7031` | MCP listener |
-| `MCP_AUDIENCE` | required when auth is on | Public MCP URL. Also the `resource` value and the source of `allowed_hosts`. |
+| `MCP_AUDIENCE` | required when auth is on | Public MCP URL in canonical form: lowercase scheme and host, no trailing slash, no default port. Also the `resource` value and the source of `allowed_hosts`. |
 | `SERVICE_TOKEN` | required when auth is on | Shared credential for `/internal/vaults` |
 
 `/health` keeps reporting the auth mode, which becomes `corliss` when the
@@ -343,8 +351,15 @@ the deployed relay, not in this repo's tests.
 2. **Client reaction to `doc-unavailable` on a denied push.** Not verified
    against the JS client. It decides whether a denied write fails quietly or
    surfaces an error.
-3. **MCP session mode.** Stateless is proposed. Not verified against the
-   hosted MCP clients this must serve.
+3. **MCP session mode.** Stateless, narrowed to a client test. The MCP
+   specification makes sessions optional through 2025-11-25 and removes them
+   in 2026-07-28, and neither Anthropic's connector docs nor Claude Code's
+   docs require a session ID or the GET stream. Not yet run against the real
+   clients. On the deployed relay, for Claude web, iOS, Desktop and Claude
+   Code: connect, list tools, read, edit, then restart the relay and call a
+   tool again without reconnecting. Pass means no client action is needed
+   after the restart. If a hosted client fails, fall back to rmcp's in-memory
+   sessions and accept a reconnect after each restart.
 4. **`/internal/vaults` path.** A separate path so the proxy can leave it
    unrouted, in place of a `did` parameter on the public `/vaults`. Confirm.
 5. **Bulk edits by a model.** No rate limit or proposal step in this spec.
