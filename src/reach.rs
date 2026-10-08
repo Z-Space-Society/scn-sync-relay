@@ -40,9 +40,9 @@ const MAX_LOAD_RETRIES: u8 = 5;
 const LAST_CHANGE_FLUSH: Duration = Duration::from_secs(60);
 
 /// The entry type that marks a folder. Every other type is a file extension.
-const FOLDER: &str = "folder";
+pub(crate) const FOLDER: &str = "folder";
 /// The only file type the relay acts on.
-const NOTE: &str = "md";
+pub(crate) const NOTE: &str = "md";
 
 #[derive(Default)]
 pub(crate) struct Index {
@@ -75,7 +75,6 @@ impl Index {
     }
 
     /// The root of the vault a document is in, if any.
-    // Read by the MCP tools, which are not built yet.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn vault_of(&self, doc: &DocumentId) -> Option<&DocumentId> {
         self.doc_to_root.get(doc)
@@ -105,7 +104,7 @@ pub(crate) struct Entry {
 }
 
 impl Entry {
-    fn doc_id(&self) -> Option<DocumentId> {
+    pub(crate) fn doc_id(&self) -> Option<DocumentId> {
         Some(AutomergeUrl::from_str(&self.url).ok()?.document_id().clone())
     }
 }
@@ -114,7 +113,7 @@ impl Entry {
 ///
 /// The JS client writes a string as a text object. Older writers and other
 /// tools store a scalar. Both mean the same thing here.
-fn read_string(doc: &Automerge, obj: &automerge::ObjId, key: &str) -> Option<String> {
+pub(crate) fn read_string(doc: &Automerge, obj: &automerge::ObjId, key: &str) -> Option<String> {
     match doc.get(obj, key).ok()?? {
         (automerge::Value::Object(ObjType::Text), id) => doc.text(id).ok(),
         (automerge::Value::Scalar(scalar), _) => Some(scalar.as_str()?.to_string()),
@@ -122,7 +121,7 @@ fn read_string(doc: &Automerge, obj: &automerge::ObjId, key: &str) -> Option<Str
     }
 }
 
-fn put_string(
+pub(crate) fn put_string(
     tx: &mut impl Transactable,
     obj: &automerge::ObjId,
     key: &str,
@@ -168,8 +167,6 @@ pub(crate) fn new_folder(title: &str) -> Result<Automerge, AutomergeError> {
 }
 
 /// Append an entry to a folder document's `docs` list.
-// Called by the MCP `create_note` tool, which is not built yet.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn add_entry(doc: &mut Automerge, entry: &Entry) -> Result<(), AutomergeError> {
     let Some((automerge::Value::Object(ObjType::List), docs)) = doc.get(ROOT, "docs")? else {
         return Err(AutomergeError::InvalidOp(ObjType::Map));
@@ -223,7 +220,7 @@ impl Authz {
         });
     }
 
-    async fn open(&self, doc: &DocumentId) -> Option<DocHandle> {
+    pub(crate) async fn open(&self, doc: &DocumentId) -> Option<DocHandle> {
         match tokio::time::timeout(LOAD_TIMEOUT, self.0.repo.find(doc.clone())).await {
             Ok(Ok(handle)) => handle,
             _ => None,

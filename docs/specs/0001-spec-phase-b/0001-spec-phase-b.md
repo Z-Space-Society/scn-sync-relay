@@ -335,7 +335,9 @@ connection. See open question 7.
 - Same process and same `samod::Repo` as sync. Tools read and edit the live
   documents, and edits reach connected peers through samod's normal sync.
 - Its own listener, so sync and MCP traffic stay separate in the proxy and in
-  logs.
+  logs. It is mounted at the path of `MCP_AUDIENCE`, the root when that URL
+  has none. With `REQUIRE_AUTH=false` there is no member to act as and the
+  listener is not started.
 - `rmcp`'s `StreamableHttpService`, mounted on an axum router.
 - `allowed_hosts` set to the public MCP host. rmcp's default accepts only
   loopback and answers `403` to anything else.
@@ -372,6 +374,25 @@ Tools address a note by vault and path, resolved through the folder
 documents at call time. A note with no folder entry cannot be reached by any
 tool. `create_note` refuses a path that already has an entry.
 
+- **Vault.** Every tool but `list_vaults` takes an optional `vault` name,
+  matched without regard to case. It may be left out when the caller has
+  exactly one vault; with more, the tool refuses and lists their names.
+- **Admission at call time.** A tool follows an entry only to a document the
+  caller created, the same rule the reachability index applies. It does not
+  wait for the index, so a note is readable the moment it is created.
+- **Paths** match names after NFC and case folding, and answers spell a path
+  as the folders do.
+- **`list_notes`** takes `recursive`, off by default.
+- **`create_note`** creates the folders on the way that are missing, and
+  takes only a name ending in `.md`.
+- **`edit_note`** takes `old_text`, `new_text` and `replace_all`. Several
+  matches without `replace_all` is refused. What `old_text` and `new_text`
+  share at either end is left untouched; only the differing middle is
+  spliced.
+- **`append_note`** starts the added text on a new line.
+- **Refusals** (no such note, already exists, ambiguous match) come back as a
+  tool result marked as an error, with text the model can act on.
+
 | Tool | Does |
 |---|---|
 | `list_vaults` | The caller's vaults |
@@ -387,11 +408,18 @@ Writes are targeted text edits. No tool replaces a whole document. Tools use
 
 ### M4. Search
 
-An in-memory index per vault, built on the first search of that vault and
-dropped on restart. A note's text is reindexed from `DocHandle::changes`, at
-most once a second per note. Which notes are in the index, and their paths,
-follow the reachability index, so a deleted note leaves the index and a moved
-or renamed note is returned at its new path.
+No index. Each search walks the vault's folders and reads every note's text
+from the documents the relay already holds in memory. A deleted note is not
+found, and a moved or renamed note is returned at its new path, because the
+walk is the folders as they are at that moment.
+
+A note matches when it contains every word of the query, in its text or its
+path, without regard to case. Results are ordered by how often the words
+appear, and carry up to three matching lines each. Default 20 results, at
+most 50.
+
+An index (in memory, or a Postgres projection) is the next step if a search
+gets slow. Measure on a real vault first.
 
 ## Configuration
 

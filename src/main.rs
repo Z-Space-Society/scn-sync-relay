@@ -8,11 +8,13 @@ mod auth;
 mod authz;
 mod config;
 mod filter;
+mod mcp;
 mod reach;
 mod storage;
 mod vaults;
 mod wire;
 
+use std::future::IntoFuture;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -107,7 +109,7 @@ async fn main() -> Result<()> {
             .map(|auth| auth.sync_audience.as_str())
             .unwrap_or_default()
             .into(),
-        authz,
+        authz: authz.clone(),
         enforce: config.require_auth,
         service_token: config.service_token.as_deref().map(Arc::from),
     });
@@ -121,18 +123,33 @@ async fn main() -> Result<()> {
         auth = verifier.name(),
         "scn-sync-relay listening"
     );
-    if !config.require_auth {
+    let sync = axum::serve(listener, app).with_graceful_shutdown(shutdown());
+
+    // The MCP service acts as the member a token names. With no verifier
+    // there is no member, so it is not started.
+    let Some(auth) = &config.auth else {
         tracing::warn!(
             "running WITHOUT a membership gate: any peer that can reach this \
              port can sync any document this relay holds. This is only sound \
-             while the service has no route through the proxy."
+             while the service has no route through the proxy. The MCP \
+             service is not started."
         );
-    }
+        return sync.await.context("server error");
+    };
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown())
+    let mcp_app = mcp::router(
+        authz,
+        Arc::clone(&verifier),
+        &auth.mcp_audience,
+        &auth.oidc_issuer,
+    )?;
+    let mcp_listener = tokio::net::TcpListener::bind(&config.mcp_bind)
         .await
-        .context("server error")?;
+        .with_context(|| format!("could not bind {}", config.mcp_bind))?;
+    tracing::info!(bind = %config.mcp_bind, audience = %auth.mcp_audience, "MCP service listening");
+    let mcp = axum::serve(mcp_listener, mcp_app).with_graceful_shutdown(shutdown());
+
+    tokio::try_join!(sync.into_future(), mcp.into_future()).context("server error")?;
 
     Ok(())
 }
@@ -269,18 +286,28 @@ mod tests {
     const ALICE: &str = "did:plc:alice";
     const BOB: &str = "did:plc:bob";
 
-    /// The relay's router on a loopback port, on the test's own database and
-    /// gated by a verifier that trusts the test issuer. Calling it twice on
-    /// one pool is a restart.
-    async fn relay(pool: &PgPool) -> (String, Authz) {
+    /// A running relay: both listeners on loopback ports, on the test's own
+    /// database, gated by a verifier that trusts the test issuer.
+    struct Relay {
+        /// Base URL of the sync listener.
+        base: String,
+        /// The MCP URL, which is also the audience an MCP token must carry.
+        mcp: String,
+        authz: Authz,
+        repo: Repo,
+    }
+
+    /// Start a relay. Calling it twice on one pool is a restart.
+    async fn start(pool: &PgPool) -> Relay {
         let issuer = Issuer::start().await;
+        let verifier: Arc<dyn DidVerifier> = Arc::new(issuer.verifier().await);
         let (authz, repo) = authz::tests::open(pool).await;
         let acceptor = repo
             .make_acceptor("ws://relay.test/sync".parse().unwrap())
             .unwrap();
         let app = router(AppState {
             acceptor,
-            verifier: Arc::new(issuer.verifier().await),
+            verifier: Arc::clone(&verifier),
             sync_audience: SYNC_AUDIENCE.into(),
             authz: authz.clone(),
             enforce: true,
@@ -289,7 +316,23 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (base, authz)
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mcp = format!("http://{}", listener.local_addr().unwrap());
+        let app = mcp::router(authz.clone(), verifier, &mcp, auth::tests::ISSUER).unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        Relay {
+            base,
+            mcp,
+            authz,
+            repo,
+        }
+    }
+
+    async fn relay(pool: &PgPool) -> (String, Authz) {
+        let relay = start(pool).await;
+        (relay.base, relay.authz)
     }
 
     /// Ask for a websocket upgrade and report the status of the answer.
@@ -654,5 +697,368 @@ mod tests {
         assert_eq!(closed.reason.as_str(), "token expired");
         // Not closed early: it stayed open until `exp`.
         assert!(opened.elapsed() >= std::time::Duration::from_millis(900));
+    }
+
+    impl Relay {
+        fn mcp_token(&self, did: &str) -> String {
+            TokenSpec::default()
+                .claim("sub", json!(did))
+                .claim("aud", json!(self.mcp))
+                .sign()
+        }
+
+        /// One JSON-RPC request to the MCP service, as a client sends it.
+        async fn rpc(&self, token: Option<&str>, method: &str, params: Value) -> reqwest::Response {
+            let mut request = reqwest::Client::new()
+                .post(&self.mcp)
+                .header("accept", "application/json, text/event-stream")
+                .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }));
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            request.send().await.unwrap()
+        }
+
+        /// Call a tool as a member. Returns whether the tool reported an
+        /// error, and the text it answered with.
+        async fn call(&self, did: &str, tool: &str, arguments: Value) -> (bool, String) {
+            let response = self
+                .rpc(
+                    Some(&self.mcp_token(did)),
+                    "tools/call",
+                    json!({ "name": tool, "arguments": arguments }),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{tool}");
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/json",
+                "{tool} answered with a stream"
+            );
+            let body: Value = response.json().await.unwrap();
+            let result = &body["result"];
+            assert!(result.is_object(), "{tool}: {body}");
+            (
+                result["isError"].as_bool().unwrap_or(false),
+                result["content"][0]["text"].as_str().unwrap_or_default().to_string(),
+            )
+        }
+
+        /// Call a tool that is expected to work, and return its answer.
+        async fn ok(&self, did: &str, tool: &str, arguments: Value) -> String {
+            let (is_error, text) = self.call(did, tool, arguments).await;
+            assert!(!is_error, "{tool} refused: {text}");
+            text
+        }
+
+        /// Call a tool that is expected to refuse, and return why.
+        async fn refused(&self, did: &str, tool: &str, arguments: Value) -> String {
+            let (is_error, text) = self.call(did, tool, arguments).await;
+            assert!(is_error, "{tool} should have refused, said: {text}");
+            text
+        }
+    }
+
+    /// The paths a listing or a search returned.
+    fn paths(answer: &str) -> Vec<String> {
+        let items: Value = serde_json::from_str(answer).unwrap();
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["path"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn mcp_sends_an_unauthenticated_client_to_the_issuer(pool: PgPool) {
+        let relay = start(&pool).await;
+        let metadata_url = format!("{}/.well-known/oauth-protected-resource", relay.mcp);
+        let sync_token = member_token(ALICE);
+
+        for token in [None, Some("garbage"), Some(sync_token.as_str())] {
+            let response = relay.rpc(token, "tools/list", json!({})).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.headers()["www-authenticate"],
+                format!("Bearer resource_metadata=\"{metadata_url}\"")
+            );
+        }
+
+        let metadata: Value = reqwest::get(&metadata_url).await.unwrap().json().await.unwrap();
+        assert_eq!(metadata["resource"], relay.mcp);
+        assert_eq!(metadata["authorization_servers"], json!([auth::tests::ISSUER]));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn mcp_initializes_and_lists_its_tools(pool: PgPool) {
+        let relay = start(&pool).await;
+        let token = relay.mcp_token(ALICE);
+
+        let response = relay
+            .rpc(
+                Some(&token),
+                "initialize",
+                json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "test", "version": "0" },
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // Stateless: no session to carry into the next request.
+        assert!(response.headers().get("mcp-session-id").is_none());
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["result"]["serverInfo"]["name"], "scn-sync-relay");
+
+        let body: Value = relay
+            .rpc(Some(&token), "tools/list", json!({}))
+            .await
+            .json()
+            .await
+            .unwrap();
+        let mut names: Vec<_> = body["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "append_note",
+                "create_note",
+                "edit_note",
+                "list_notes",
+                "list_vaults",
+                "read_note",
+                "search_notes"
+            ]
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_member_creates_reads_edits_and_searches_notes(pool: PgPool) {
+        let relay = start(&pool).await;
+        create_vault(&relay.base, ALICE, "Notes").await;
+
+        // No initialize was ever sent: every call stands on its own token.
+        assert!(relay.ok(ALICE, "list_vaults", json!({})).await.contains("Notes"));
+        assert_eq!(paths(&relay.ok(ALICE, "list_notes", json!({})).await), [""; 0]);
+
+        relay
+            .ok(
+                ALICE,
+                "create_note",
+                json!({ "path": "Projects/plan.md", "content": "# Plan\nShip the relay 🚀 first.\n" }),
+            )
+            .await;
+        relay
+            .ok(ALICE, "create_note", json!({ "path": "inbox.md", "content": "relay relay" }))
+            .await;
+
+        assert_eq!(
+            paths(&relay.ok(ALICE, "list_notes", json!({})).await),
+            ["inbox.md", "Projects"]
+        );
+        assert_eq!(
+            paths(&relay.ok(ALICE, "list_notes", json!({ "recursive": true })).await),
+            ["inbox.md", "Projects", "Projects/plan.md"]
+        );
+        assert_eq!(
+            paths(&relay.ok(ALICE, "list_notes", json!({ "path": "projects" })).await),
+            ["Projects/plan.md"]
+        );
+
+        // The edit lands after an emoji, where text positions are easy to
+        // get wrong.
+        relay
+            .ok(
+                ALICE,
+                "edit_note",
+                json!({ "path": "Projects/plan.md", "old_text": "🚀 first", "new_text": "🚀 before Corliss" }),
+            )
+            .await;
+        relay
+            .ok(ALICE, "append_note", json!({ "path": "Projects/plan.md", "text": "Then the plugin." }))
+            .await;
+        relay
+            .ok(ALICE, "append_note", json!({ "path": "inbox.md", "text": "second line" }))
+            .await;
+        assert_eq!(
+            relay.ok(ALICE, "read_note", json!({ "path": "Projects/plan.md" })).await,
+            "# Plan\nShip the relay 🚀 before Corliss.\nThen the plugin."
+        );
+        assert_eq!(
+            relay.ok(ALICE, "read_note", json!({ "path": "/inbox.md" })).await,
+            "relay relay\nsecond line"
+        );
+
+        // Best match first, and a note found by a word in its path.
+        let found = relay.ok(ALICE, "search_notes", json!({ "query": "RELAY" })).await;
+        assert_eq!(paths(&found), ["inbox.md", "Projects/plan.md"]);
+        assert!(found.contains("Ship the relay"));
+        let found = relay.ok(ALICE, "search_notes", json!({ "query": "projects plugin" })).await;
+        assert_eq!(paths(&found), ["Projects/plan.md"]);
+        let found = relay.ok(ALICE, "search_notes", json!({ "query": "nothing-says-this" })).await;
+        assert!(paths(&found).is_empty());
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn tools_refuse_what_they_should(pool: PgPool) {
+        let relay = start(&pool).await;
+        create_vault(&relay.base, ALICE, "Notes").await;
+        relay
+            .ok(ALICE, "create_note", json!({ "path": "a.md", "content": "one two one" }))
+            .await;
+
+        for (tool, arguments) in [
+            // Already there, in any letter case.
+            ("create_note", json!({ "path": "A.md", "content": "" })),
+            ("create_note", json!({ "path": "notes.txt", "content": "" })),
+            ("create_note", json!({ "path": ".hidden/a.md", "content": "" })),
+            ("create_note", json!({ "path": "../a.md", "content": "" })),
+            // A note is not a folder.
+            ("create_note", json!({ "path": "a.md/b.md", "content": "" })),
+            ("read_note", json!({ "path": "missing.md" })),
+            ("list_notes", json!({ "path": "missing" })),
+            ("edit_note", json!({ "path": "a.md", "old_text": "three", "new_text": "3" })),
+            // Two matches and no replace_all.
+            ("edit_note", json!({ "path": "a.md", "old_text": "one", "new_text": "1" })),
+            ("edit_note", json!({ "path": "a.md", "old_text": "", "new_text": "x" })),
+            ("append_note", json!({ "path": "missing.md", "text": "x" })),
+            ("read_note", json!({ "vault": "Other", "path": "a.md" })),
+            ("search_notes", json!({ "query": "  " })),
+        ] {
+            relay.refused(ALICE, tool, arguments).await;
+        }
+        // None of that changed the note.
+        assert_eq!(relay.ok(ALICE, "read_note", json!({ "path": "a.md" })).await, "one two one");
+
+        relay
+            .ok(
+                ALICE,
+                "edit_note",
+                json!({ "path": "a.md", "old_text": "one", "new_text": "1", "replace_all": true }),
+            )
+            .await;
+        assert_eq!(relay.ok(ALICE, "read_note", json!({ "path": "a.md" })).await, "1 two 1");
+
+        // With a second vault, the vault has to be named.
+        create_vault(&relay.base, ALICE, "Work").await;
+        let why = relay.refused(ALICE, "read_note", json!({ "path": "a.md" })).await;
+        assert!(why.contains("Notes") && why.contains("Work"), "{why}");
+        relay.ok(ALICE, "read_note", json!({ "vault": "notes", "path": "a.md" })).await;
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn tools_never_reach_another_members_notes(pool: PgPool) {
+        let relay = start(&pool).await;
+        create_vault(&relay.base, ALICE, "Notes").await;
+        let (_, bobs) = create_vault(&relay.base, BOB, "Notes").await;
+        relay
+            .ok(ALICE, "create_note", json!({ "path": "secret.md", "content": "alice only" }))
+            .await;
+
+        // Same vault name, his own vault: hers is not in it.
+        assert!(paths(&relay.ok(BOB, "list_notes", json!({ "recursive": true })).await).is_empty());
+        relay.refused(BOB, "read_note", json!({ "path": "secret.md" })).await;
+        assert!(paths(&relay.ok(BOB, "search_notes", json!({ "query": "alice" })).await).is_empty());
+
+        // Bob writes a link to her note into his own root folder.
+        let alice = auth::Did(ALICE.into());
+        let notes = mcp::tests::notes_of(&relay.authz, &alice).await;
+        let secret = notes.into_iter().find(|(path, _)| path == "secret.md").unwrap().1;
+        let bobs_root: samod::DocumentId = bobs["root_doc_id"].as_str().unwrap().parse().unwrap();
+        let entry = reach::Entry {
+            name: "stolen.md".to_string(),
+            kind: "md".to_string(),
+            url: samod::AutomergeUrl::from(&secret).to_string(),
+        };
+        relay
+            .repo
+            .find(bobs_root)
+            .await
+            .unwrap()
+            .unwrap()
+            .with_document_async(move |doc| reach::add_entry(doc, &entry))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(paths(&relay.ok(BOB, "list_notes", json!({})).await).is_empty());
+        relay.refused(BOB, "read_note", json!({ "path": "stolen.md" })).await;
+        relay
+            .refused(BOB, "append_note", json!({ "path": "stolen.md", "text": "mine now" }))
+            .await;
+        assert!(paths(&relay.ok(BOB, "search_notes", json!({ "query": "alice" })).await).is_empty());
+        assert_eq!(
+            relay.ok(ALICE, "read_note", json!({ "path": "secret.md" })).await,
+            "alice only"
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn an_mcp_edit_reaches_a_sync_client_and_a_sync_edit_reaches_mcp(pool: PgPool) {
+        use automerge::{transaction::Transactable, ReadDoc};
+
+        let relay = start(&pool).await;
+        let (_, vault) = create_vault(&relay.base, ALICE, "Notes").await;
+        let root: samod::DocumentId = vault["root_doc_id"].as_str().unwrap().parse().unwrap();
+
+        // Her device is connected and syncing the vault's root before
+        // anything is written.
+        let device = client(&relay.base, ALICE).await;
+        let folder = device.find(root).await.unwrap().expect("the vault root");
+
+        relay
+            .ok(ALICE, "create_note", json!({ "path": "today.md", "content": "from Claude" }))
+            .await;
+
+        // The new entry arrives in the folder she already has...
+        let mut entries = Vec::new();
+        for _ in 0..100 {
+            entries = folder
+                .with_document_async(|doc| reach::read_entries(doc))
+                .await
+                .unwrap();
+            if !entries.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(entries.len(), 1, "the entry never reached the device");
+        assert_eq!((entries[0].name.as_str(), entries[0].kind.as_str()), ("today.md", "md"));
+
+        // ...and the note it points at can be fetched, as the plugin would.
+        let note_id = entries[0].doc_id().unwrap();
+        let note = device.find(note_id).await.unwrap().expect("the note");
+        let text = note
+            .with_document_async(|doc| reach::read_string(doc, &automerge::ROOT, "content"))
+            .await
+            .unwrap();
+        assert_eq!(text.as_deref(), Some("from Claude"));
+
+        // She types on the device. MCP reads it with no laptop in between.
+        note.with_document_async(|doc| {
+            let (_, content) = doc.get(automerge::ROOT, "content").unwrap().unwrap();
+            let end = doc.length(&content);
+            let mut tx = doc.transaction();
+            tx.splice_text(&content, end, 0, ", and from the phone").unwrap();
+            tx.commit();
+        })
+        .await
+        .unwrap();
+
+        for _ in 0..100 {
+            let text = relay.ok(ALICE, "read_note", json!({ "path": "today.md" })).await;
+            if text == "from Claude, and from the phone" {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the device's edit never reached MCP");
     }
 }

@@ -36,6 +36,10 @@ pub struct Config {
     /// The credential Corliss presents on `/internal/vaults`. Required when
     /// `require_auth` is on. Without it those endpoints refuse every call.
     pub service_token: Option<String>,
+
+    /// Address the MCP service binds. A listener of its own, so sync and MCP
+    /// traffic stay separate in the proxy and in logs.
+    pub mcp_bind: String,
 }
 
 pub struct AuthConfig {
@@ -50,6 +54,12 @@ pub struct AuthConfig {
     /// The `aud` a sync token must carry: this relay's public sync URL,
     /// spelled exactly as the issuer spells it.
     pub sync_audience: String,
+
+    /// The `aud` an MCP token must carry: the public MCP URL in canonical
+    /// form (lowercase scheme and host, no trailing slash, no default port).
+    /// Also the `resource` the relay advertises, the host it accepts MCP
+    /// requests for, and the path the MCP service is mounted at.
+    pub mcp_audience: String,
 }
 
 impl Config {
@@ -71,6 +81,7 @@ impl Config {
                 oidc_issuer: required_for_auth("OIDC_ISSUER")?,
                 oidc_jwks_url: required_for_auth("OIDC_JWKS_URL")?,
                 sync_audience: required_for_auth("SYNC_AUDIENCE")?,
+                mcp_audience: required_for_auth("MCP_AUDIENCE")?,
             })
         } else {
             None
@@ -88,6 +99,7 @@ impl Config {
             require_auth,
             auth,
             service_token,
+            mcp_bind: var("MCP_BIND").unwrap_or_else(|_| "0.0.0.0:7031".to_string()),
         })
     }
 }
