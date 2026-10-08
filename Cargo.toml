@@ -9,13 +9,19 @@ repository = "https://github.com/Z-Space-Society/scn-sync-relay"
 
 [dependencies]
 samod = { version = "0.15", features = ["tokio", "axum"] }
+# The version samod is built on: folder documents are read and written with it.
+automerge = "0.12"
 axum = { version = "0.8", features = ["ws"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "sync", "time"] }
+futures = "0.3"
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",
     "postgres",
+    "chrono",
 ] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+subtle = "2"
 # Pure-Rust crypto for token checks, and ring for TLS (the provider sqlx already
 # builds), so the deploy's cold build needs no second C crypto library.
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
@@ -29,3 +35,8 @@ serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# `#[sqlx::test]` gives each test its own database on the server DATABASE_URL
+# points at.
+sqlx = { version = "0.9", default-features = false, features = ["macros", "migrate"] }

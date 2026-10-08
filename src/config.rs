@@ -32,6 +32,10 @@ pub struct Config {
     /// What the token verifier needs. Present exactly when `require_auth` is
     /// on, so a gated relay cannot start half configured.
     pub auth: Option<AuthConfig>,
+
+    /// The credential Corliss presents on `/internal/vaults`. Required when
+    /// `require_auth` is on. Without it those endpoints refuse every call.
+    pub service_token: Option<String>,
 }
 
 pub struct AuthConfig {
@@ -72,11 +76,18 @@ impl Config {
             None
         };
 
+        let service_token = if require_auth {
+            Some(required_for_auth("SERVICE_TOKEN")?)
+        } else {
+            var("SERVICE_TOKEN").ok().filter(|v| !v.trim().is_empty())
+        };
+
         Ok(Self {
             database_url,
             bind,
             require_auth,
             auth,
+            service_token,
         })
     }
 }

@@ -84,6 +84,9 @@ here.
 - A note document is `{"@patchwork": {"type": "file"}, "name", "extension":
   "md", "mimeType": "text/markdown", "content"}`. `content` is an Automerge
   text object holding the file's text exactly.
+- String values are Automerge text objects, which is how the JS client
+  writes a string. The relay writes them that way and reads either a text
+  object or a scalar string.
 - An entry's `type` is `folder`, or the file's extension. The relay acts on
   `folder` and `md` and ignores every other entry: it does not walk it,
   list it, search it or admit it to a vault's reachable set.
@@ -182,7 +185,7 @@ CREATE TABLE vaults (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_change_at TIMESTAMPTZ
 );
-CREATE INDEX vaults_owner ON vaults (owner_did);
+CREATE UNIQUE INDEX vaults_owner_name ON vaults (owner_did, lower(name));
 
 CREATE TABLE doc_creators (
   doc_id      TEXT PRIMARY KEY,
@@ -229,6 +232,10 @@ A vault in every response is one JSON object:
 Both list endpoints return `200` with `{"vaults": [...]}`, oldest first, and
 an empty list for a member with none. Create returns `201` with the vault
 object.
+
+Errors on the `/internal/` endpoints are `{"error": "<code>"}`: `400` with
+`invalid_did` or `invalid_name`, `409` with `name_taken`. A missing or wrong
+credential on any of the three is `401` with no JSON body.
 
 Both `/internal/` endpoints are authenticated with the shared service
 credential, sent as `Authorization: Bearer <SERVICE_TOKEN>`. The prefix exists so the reverse proxy can leave it unrouted;

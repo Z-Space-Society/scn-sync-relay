@@ -294,7 +294,7 @@ impl CorlissVerifier {
 
 /// `did:<method>:<identifier>`, the shape and nothing more. Whether the DID is
 /// a member is the issuer's call, made when it signed the token.
-fn is_did(s: &str) -> bool {
+pub fn is_did(s: &str) -> bool {
     let mut parts = s.splitn(3, ':');
     parts.next() == Some("did")
         && parts.next().is_some_and(|method| !method.is_empty())

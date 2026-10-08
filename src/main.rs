@@ -5,8 +5,11 @@
 //! websocket upgrade; see `auth.rs` and [`build_verifier`].
 
 mod auth;
+mod authz;
 mod config;
+mod reach;
 mod storage;
+mod vaults;
 
 use std::sync::Arc;
 
@@ -26,6 +29,7 @@ use serde::Deserialize;
 use sqlx::postgres::PgPoolOptions;
 
 use auth::{AllowAll, CorlissVerifier, DidVerifier, Verified};
+use authz::Authz;
 use config::Config;
 use storage::PostgresStorage;
 
@@ -35,6 +39,9 @@ struct AppState {
     verifier: Arc<dyn DidVerifier>,
     /// The audience a sync token must carry. Empty when nothing is verified.
     sync_audience: Arc<str>,
+    authz: Authz,
+    /// What Corliss presents on `/internal/vaults`. `None` refuses every call.
+    service_token: Option<Arc<str>>,
 }
 
 #[tokio::main]
@@ -57,13 +64,16 @@ async fn main() -> Result<()> {
         .await
         .context("could not connect to Postgres")?;
 
-    let store = PostgresStorage::new(pool);
+    let store = PostgresStorage::new(pool.clone());
     store
         .migrate()
         .await
         .context("could not create the storage schema")?;
 
     let repo = Repo::build_tokio().with_storage(store).load().await;
+    let authz = Authz::load(pool, repo.clone())
+        .await
+        .context("could not load the ownership records")?;
 
     // The URL is used only to identify this endpoint in samod's own logs; it
     // is not something the relay binds or dials.
@@ -84,6 +94,8 @@ async fn main() -> Result<()> {
             .map(|auth| auth.sync_audience.as_str())
             .unwrap_or_default()
             .into(),
+        authz,
+        service_token: config.service_token.as_deref().map(Arc::from),
     });
 
     let listener = tokio::net::TcpListener::bind(&config.bind)
@@ -122,6 +134,11 @@ fn router(state: AppState) -> Router {
         .route("/", get(sync))
         .route("/sync", get(sync))
         .route("/health", get(health))
+        .route("/vaults", get(vaults::list_own))
+        .route(
+            "/internal/vaults",
+            get(vaults::list_for_member).post(vaults::create),
+        )
         .with_state(state)
 }
 
@@ -225,13 +242,19 @@ mod tests {
     use super::*;
 
     use auth::tests::{Issuer, TokenSpec, SYNC_AUDIENCE};
-    use serde_json::json;
+    use serde_json::{json, Value};
+    use sqlx::PgPool;
 
-    /// The relay's router on a loopback port, gated by a verifier that trusts
-    /// the test issuer. The repo is samod's in-memory default.
-    async fn relay() -> String {
+    const SERVICE_TOKEN: &str = "test-service-token";
+    const ALICE: &str = "did:plc:alice";
+    const BOB: &str = "did:plc:bob";
+
+    /// The relay's router on a loopback port, on the test's own database and
+    /// gated by a verifier that trusts the test issuer. Calling it twice on
+    /// one pool is a restart.
+    async fn relay(pool: &PgPool) -> (String, Authz) {
         let issuer = Issuer::start().await;
-        let repo = Repo::build_tokio().load().await;
+        let (authz, repo) = authz::tests::open(pool).await;
         let acceptor = repo
             .make_acceptor("ws://relay.test/sync".parse().unwrap())
             .unwrap();
@@ -239,11 +262,13 @@ mod tests {
             acceptor,
             verifier: Arc::new(issuer.verifier().await),
             sync_audience: SYNC_AUDIENCE.into(),
+            authz: authz.clone(),
+            service_token: Some(SERVICE_TOKEN.into()),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        base
+        (base, authz)
     }
 
     /// Ask for a websocket upgrade and report the status of the answer.
@@ -260,9 +285,37 @@ mod tests {
             .status()
     }
 
-    #[tokio::test]
-    async fn good_token_upgrades() {
-        let base = relay().await;
+    fn member_token(did: &str) -> String {
+        TokenSpec::default().claim("sub", json!(did)).sign()
+    }
+
+    async fn create_vault(base: &str, did: &str, name: &str) -> (StatusCode, Value) {
+        let response = reqwest::Client::new()
+            .post(format!("{base}/internal/vaults"))
+            .bearer_auth(SERVICE_TOKEN)
+            .json(&json!({ "did": did, "name": name }))
+            .send()
+            .await
+            .unwrap();
+        (response.status(), response.json().await.unwrap())
+    }
+
+    /// The names of the vaults a listing returns.
+    async fn names(request: reqwest::RequestBuilder) -> Vec<String> {
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        body["vaults"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|vault| vault["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn good_token_upgrades(pool: PgPool) {
+        let (base, _) = relay(&pool).await;
         let token = TokenSpec::default().sign();
         for path in ["/", "/sync"] {
             let status = upgrade(&format!("{base}{path}?access_token={token}")).await;
@@ -270,9 +323,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn bad_or_missing_token_gets_401_before_upgrade() {
-        let base = relay().await;
+    #[sqlx::test(migrations = false)]
+    async fn bad_or_missing_token_gets_401_before_upgrade(pool: PgPool) {
+        let (base, _) = relay(&pool).await;
         let expired = TokenSpec::default().claim("exp", json!(1)).sign();
         let wrong_audience = TokenSpec::default()
             .claim("aud", json!("https://mcp.corliss.test"))
@@ -287,5 +340,114 @@ mod tests {
             let status = upgrade(&format!("{base}/{query}")).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{query}");
         }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn corliss_creates_a_vault_only_its_owner_can_open(pool: PgPool) {
+        let (base, authz) = relay(&pool).await;
+
+        let (status, vault) = create_vault(&base, ALICE, "Notes").await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(vault["name"], "Notes");
+        assert_eq!(
+            vault["url"],
+            format!("automerge:{}", vault["root_doc_id"].as_str().unwrap())
+        );
+        assert!(vault["created_at"].is_string());
+        assert!(vault["last_change_at"].is_null());
+
+        let root = vault["root_doc_id"].as_str().unwrap().parse().unwrap();
+        assert!(authz.may_open(&auth::Did(ALICE.into()), &root));
+        assert!(!authz.may_open(&auth::Did(BOB.into()), &root));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn create_refuses_duplicates_and_bad_input(pool: PgPool) {
+        let (base, _) = relay(&pool).await;
+        create_vault(&base, ALICE, "Notes").await;
+
+        let (status, body) = create_vault(&base, ALICE, "NOTES").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "name_taken");
+
+        let (status, _) = create_vault(&base, BOB, "Notes").await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, body) = create_vault(&base, ALICE, "  ").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_name");
+
+        let (status, body) = create_vault(&base, "alice", "Other").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_did");
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn listings_show_only_the_members_own_vaults(pool: PgPool) {
+        let (base, _) = relay(&pool).await;
+        create_vault(&base, ALICE, "Notes").await;
+        create_vault(&base, ALICE, "Work").await;
+        create_vault(&base, BOB, "Private").await;
+        let client = reqwest::Client::new();
+
+        let own = client
+            .get(format!("{base}/vaults"))
+            .bearer_auth(member_token(ALICE));
+        assert_eq!(names(own).await, ["Notes", "Work"]);
+
+        let for_bob = client
+            .get(format!("{base}/internal/vaults?did={BOB}"))
+            .bearer_auth(SERVICE_TOKEN);
+        assert_eq!(names(for_bob).await, ["Private"]);
+
+        let nobody = client
+            .get(format!("{base}/vaults"))
+            .bearer_auth(member_token("did:plc:carol"));
+        assert!(names(nobody).await.is_empty());
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn vault_endpoints_refuse_the_wrong_credential(pool: PgPool) {
+        let (base, _) = relay(&pool).await;
+        let client = reqwest::Client::new();
+        let member = member_token(ALICE);
+        let internal = format!("{base}/internal/vaults");
+        let for_alice = format!("{internal}?did={ALICE}");
+        let body = json!({ "did": ALICE, "name": "Notes" });
+
+        for request in [
+            // The member endpoint: no token, the service credential, a token
+            // for another audience.
+            client.get(format!("{base}/vaults")),
+            client.get(format!("{base}/vaults")).bearer_auth(SERVICE_TOKEN),
+            client.get(format!("{base}/vaults")).bearer_auth(
+                TokenSpec::default()
+                    .claim("aud", json!("https://mcp.corliss.test"))
+                    .sign(),
+            ),
+            // The internal endpoints: no credential, a wrong one, a member's
+            // own token.
+            client.get(&for_alice),
+            client.get(&for_alice).bearer_auth("wrong"),
+            client.get(&for_alice).bearer_auth(&member),
+            client.post(&internal).json(&body),
+            client.post(&internal).json(&body).bearer_auth("wrong"),
+            client.post(&internal).json(&body).bearer_auth(&member),
+        ] {
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_restart_keeps_vault_records(pool: PgPool) {
+        let (base, _) = relay(&pool).await;
+        create_vault(&base, ALICE, "Notes").await;
+
+        let (base, _) = relay(&pool).await;
+        let own = reqwest::Client::new()
+            .get(format!("{base}/vaults"))
+            .bearer_auth(member_token(ALICE));
+        assert_eq!(names(own).await, ["Notes"]);
     }
 }

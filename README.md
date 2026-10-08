@@ -75,6 +75,16 @@ apart produce the same binary from the same contents. Build against the
 target's glibc — building on macOS would need a cross-compile or a static musl
 target.
 
+## Testing
+
+```sh
+DATABASE_URL=postgres://localhost/postgres cargo test
+```
+
+Most tests need a Postgres server. `DATABASE_URL` names any database on it
+that the user may create databases from: each test gets a database of its own
+and drops it when it passes.
+
 ## Releasing
 
 Deployment checks out an **annotated tag**, so the tag has to reach the remote:
