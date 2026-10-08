@@ -1,5 +1,6 @@
-# `#[sqlx::test]` shares 20 connections across every running test and gives
-# each test up to 5. More than four tests at once and some starve for 30
-# seconds and fail with PoolTimedOut.
+# `#[sqlx::test]` shares 20 connections across every running test, gives each
+# test up to 5, and needs some of the 20 itself to create and drop each test's
+# database. At four tests or more the 20 run out: tests wait 30 seconds for a
+# connection, and at full parallelism some fail with PoolTimedOut.
 [env]
-RUST_TEST_THREADS = "4"
+RUST_TEST_THREADS = "3"
