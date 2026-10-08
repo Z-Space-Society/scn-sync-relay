@@ -24,9 +24,8 @@ pub struct Config {
     /// Whether a connection must present a verified DID.
     ///
     /// Defaults to **true**, so the safe posture is the one you get by
-    /// forgetting to set it. Phase A deployments set it to false explicitly,
-    /// which is the point: running without a membership gate is a decision
-    /// someone has to write down.
+    /// forgetting to set it. Turning it off is for local work only, and is a
+    /// decision someone has to write down.
     pub require_auth: bool,
 
     /// What the token verifier needs. Present exactly when `require_auth` is

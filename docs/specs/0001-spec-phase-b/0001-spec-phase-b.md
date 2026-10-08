@@ -1,6 +1,7 @@
 # 0001 Spec: Phase B (auth, owner-only authorization, MCP)
 
-Status: draft, 2026-10-07.
+Status: built in v0.2.0, 2026-10-08. Not yet run against real clients; see
+open questions 2, 3 and 7.
 
 ## Goal
 
