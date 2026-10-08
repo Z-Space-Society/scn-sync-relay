@@ -2025,6 +2025,7 @@ dependencies = [
  "chrono",
  "futures",
  "jsonwebtoken",
+ "minicbor",
  "reqwest",
  "rustls",
  "samod",
@@ -2033,6 +2034,7 @@ dependencies = [
  "sqlx",
  "subtle",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
 ]

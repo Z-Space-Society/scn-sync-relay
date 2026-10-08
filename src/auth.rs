@@ -44,9 +44,6 @@ pub struct Verified {
     /// When the credential stops being good. A sync connection is closed at
     /// this moment, which is what cuts off a member who has left the network.
     /// `None` only from [`AllowAll`], which has no credential to expire.
-    // Unread until the transport filter lands; it is the filter that closes
-    // the socket.
-    #[allow(dead_code)]
     pub expires_at: Option<SystemTime>,
 }
 

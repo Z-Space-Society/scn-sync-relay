@@ -294,7 +294,10 @@ then calls `AcceptorHandle::accept`. The filter holds the connection's DID
 and token expiry.
 
 Envelope. Each frame is a CBOR map with string keys. The filter reads
-`type`, `senderId` and `documentId` and leaves the rest untouched.
+`type`, `senderId`, `targetId` and `documentId` and leaves the rest untouched.
+A frame that repeats one of those keys is unparseable: samod keeps the last
+value of a repeated key, so a reader that kept the first would check one
+document while samod acted on another.
 
 Inbound, by `type`:
 
@@ -306,13 +309,14 @@ Inbound, by `type`:
 | Unparseable, or any other type | Drop and log at warn |
 
 Outbound: frames carrying a `documentId` pass only if `may_open` is true.
-Others pass. This is a second wall behind the inbound check.
+Others pass, except an unparseable frame, which is withheld. This is a second wall behind the inbound check.
 
 A denied document and a document that does not exist look the same to the
 peer.
 
-Expiry: at the token's `exp` the filter sends a websocket close and ends the
-inbound stream, which makes samod drop the connection.
+Expiry: at the token's `exp` the filter sends a websocket close with code
+`1008` and reason `token expired`, and ends the inbound stream, which makes
+samod drop the connection.
 
 ### Z6. Announce policy
 

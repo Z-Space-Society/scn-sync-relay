@@ -22,6 +22,8 @@ sqlx = { version = "0.9", default-features = false, features = [
 ] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 subtle = "2"
+# The version samod uses, for reading the sync protocol's message envelope.
+minicbor = { version = "1", features = ["std"] }
 # Pure-Rust crypto for token checks, and ring for TLS (the provider sqlx already
 # builds), so the deploy's cold build needs no second C crypto library.
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
@@ -40,3 +42,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `#[sqlx::test]` gives each test its own database on the server DATABASE_URL
 # points at.
 sqlx = { version = "0.9", default-features = false, features = ["macros", "migrate"] }
+# A plain websocket client: the test sync client dials with it.
+tokio-tungstenite = "0.29"

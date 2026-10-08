@@ -122,8 +122,6 @@ impl Authz {
     /// the DID created it and no vault reaches it. The second case is a note
     /// not yet linked into a folder, one part way through a move, or one whose
     /// entry was deleted.
-    // Called by the transport filter and the MCP tools, which are not built yet.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn may_open(&self, did: &Did, doc: &DocumentId) -> bool {
         if let Some(owner) = self.0.reach.read().unwrap().owner_of(doc) {
             return owner == did;
@@ -314,7 +312,11 @@ pub(crate) mod tests {
     pub async fn open(pool: &PgPool) -> (Authz, Repo) {
         let store = PostgresStorage::new(pool.clone());
         store.migrate().await.unwrap();
-        let repo = Repo::build_tokio().with_storage(store).load().await;
+        let repo = Repo::build_tokio()
+            .with_storage(store)
+            .with_announce_policy(samod::NeverAnnounce)
+            .load()
+            .await;
         let authz = Authz::load(pool.clone(), repo.clone()).await.unwrap();
         (authz, repo)
     }

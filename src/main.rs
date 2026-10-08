@@ -7,9 +7,11 @@
 mod auth;
 mod authz;
 mod config;
+mod filter;
 mod reach;
 mod storage;
 mod vaults;
+mod wire;
 
 use std::sync::Arc;
 
@@ -24,7 +26,7 @@ use axum::{
     routing::get,
     Router,
 };
-use samod::{AcceptorHandle, Repo};
+use samod::{AcceptorHandle, NeverAnnounce, Repo};
 use serde::Deserialize;
 use sqlx::postgres::PgPoolOptions;
 
@@ -40,6 +42,9 @@ struct AppState {
     /// The audience a sync token must carry. Empty when nothing is verified.
     sync_audience: Arc<str>,
     authz: Authz,
+    /// Whether connections go through the filter. Off only with no verifier,
+    /// where there is no DID to decide by.
+    enforce: bool,
     /// What Corliss presents on `/internal/vaults`. `None` refuses every call.
     service_token: Option<Arc<str>>,
 }
@@ -70,7 +75,15 @@ async fn main() -> Result<()> {
         .await
         .context("could not create the storage schema")?;
 
-    let repo = Repo::build_tokio().with_storage(store).load().await;
+    // The relay never offers a document unasked, and never asks one peer for
+    // a document on behalf of another. A peer gets what it requests and may
+    // open, and a change still reaches every peer already syncing that
+    // document.
+    let repo = Repo::build_tokio()
+        .with_storage(store)
+        .with_announce_policy(NeverAnnounce)
+        .load()
+        .await;
     let authz = Authz::load(pool, repo.clone())
         .await
         .context("could not load the ownership records")?;
@@ -95,6 +108,7 @@ async fn main() -> Result<()> {
             .unwrap_or_default()
             .into(),
         authz,
+        enforce: config.require_auth,
         service_token: config.service_token.as_deref().map(Arc::from),
     });
 
@@ -198,8 +212,14 @@ async fn sync(
 
 async fn handle_socket(socket: WebSocket, state: AppState, verified: Verified) {
     let did = verified.did;
-    // No expected peer ID: samod's peer ID is the client's own choice and says
-    // nothing about who it is. The DID is what the connection is bound to.
+    if state.enforce {
+        let filter = filter::Filter::new(state.authz, did);
+        filter::run(socket, &state.acceptor, filter, verified.expires_at).await;
+        return;
+    }
+
+    // Ungated: nobody was authenticated, so there is no DID to filter by and
+    // samod is handed the socket directly.
     match state.acceptor.accept_axum(socket, None) {
         Ok(_conn) => {
             // samod drives the connection on its own task, so there is nothing
@@ -263,6 +283,7 @@ mod tests {
             verifier: Arc::new(issuer.verifier().await),
             sync_audience: SYNC_AUDIENCE.into(),
             authz: authz.clone(),
+            enforce: true,
             service_token: Some(SERVICE_TOKEN.into()),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -449,5 +470,189 @@ mod tests {
             .get(format!("{base}/vaults"))
             .bearer_auth(member_token(ALICE));
         assert_eq!(names(own).await, ["Notes"]);
+    }
+
+    /// Dials the relay's websocket the way a sync client does, token in the
+    /// URL.
+    struct WsDialer(samod::Url);
+
+    impl samod::Dialer for WsDialer {
+        type Error = std::convert::Infallible;
+
+        fn url(&self) -> samod::Url {
+            self.0.clone()
+        }
+
+        fn connect(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<samod::Transport, samod::DialError<Self::Error>>,
+                    > + Send,
+            >,
+        > {
+            use futures::{SinkExt, StreamExt};
+            use tokio_tungstenite::tungstenite::{Error, Message};
+
+            let url = self.0.clone();
+            Box::pin(async move {
+                let (socket, _) = tokio_tungstenite::connect_async(url.as_str())
+                    .await
+                    .map_err(samod::DialError::transient)?;
+                let (sink, stream) = socket.split();
+                let stream = stream.filter_map(|message| async move {
+                    match message {
+                        Ok(Message::Binary(frame)) => Some(Ok(frame.to_vec())),
+                        Ok(_) => None,
+                        Err(e) => Some(Err(e)),
+                    }
+                });
+                let sink = sink.with(|frame: Vec<u8>| async move {
+                    Ok::<_, Error>(Message::Binary(frame.into()))
+                });
+                Ok(samod::Transport::new(Box::pin(stream), Box::pin(sink)))
+            })
+        }
+    }
+
+    fn sync_url(base: &str, token: &str) -> String {
+        format!("{}/?access_token={token}", base.replace("http://", "ws://"))
+    }
+
+    /// A sync client of its own, connected to the relay as `did`.
+    async fn client(base: &str, did: &str) -> Repo {
+        let repo = Repo::build_tokio().load().await;
+        let url = sync_url(base, &member_token(did)).parse().unwrap();
+        repo.dial(samod::BackoffConfig::default(), Arc::new(WsDialer(url)))
+            .unwrap()
+            .established()
+            .await
+            .unwrap();
+        repo
+    }
+
+    /// A document with one key set, so there is something to tell apart from
+    /// an empty one.
+    fn doc_with(key: &str, value: &str) -> automerge::Automerge {
+        use automerge::transaction::Transactable;
+        let mut doc = automerge::Automerge::new();
+        let mut tx = doc.transaction();
+        tx.put(automerge::ROOT, key, value).unwrap();
+        tx.commit();
+        doc
+    }
+
+    async fn value_of(handle: &samod::DocHandle, key: &'static str) -> Option<String> {
+        use automerge::ReadDoc;
+        handle
+            .with_document_async(move |doc| {
+                let (value, _) = doc.get(automerge::ROOT, key).ok()??;
+                Some(value.as_str()?.to_string())
+            })
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_member_syncs_their_own_documents_and_nobody_elses(pool: PgPool) {
+        let (base, authz) = relay(&pool).await;
+        let laptop = client(&base, ALICE).await;
+        let note = laptop.create(doc_with("title", "plan")).await.unwrap();
+        let id = note.document_id().clone();
+        authz::tests::eventually("the relay has the note", || {
+            authz.creator_of(&id).is_some()
+        })
+        .await;
+        assert!(authz.may_open(&auth::Did(ALICE.into()), &id));
+
+        // Her phone gets it from the relay, with the laptop's content.
+        let phone = client(&base, ALICE).await;
+        let on_phone = phone.find(id.clone()).await.unwrap().expect("found");
+        assert_eq!(value_of(&on_phone, "title").await.as_deref(), Some("plan"));
+
+        // Bob is told it is not there, and asking does not make it his.
+        let bob = client(&base, BOB).await;
+        assert!(bob.find(id.clone()).await.unwrap().is_none());
+        assert_eq!(authz.creator_of(&id), Some(auth::Did(ALICE.into())));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_vault_root_reaches_its_owner_only(pool: PgPool) {
+        let (base, _) = relay(&pool).await;
+        let (_, vault) = create_vault(&base, ALICE, "Notes").await;
+        let root: samod::DocumentId = vault["root_doc_id"].as_str().unwrap().parse().unwrap();
+
+        let alice = client(&base, ALICE).await;
+        assert!(alice.find(root.clone()).await.unwrap().is_some());
+
+        let bob = client(&base, BOB).await;
+        assert!(bob.find(root).await.unwrap().is_none());
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_change_reaches_a_peer_already_syncing_the_document(pool: PgPool) {
+        let (base, authz) = relay(&pool).await;
+        let laptop = client(&base, ALICE).await;
+        let note = laptop.create(doc_with("title", "plan")).await.unwrap();
+        let id = note.document_id().clone();
+        authz::tests::eventually("the relay has the note", || {
+            authz.creator_of(&id).is_some()
+        })
+        .await;
+
+        let phone = client(&base, ALICE).await;
+        let on_phone = phone.find(id).await.unwrap().expect("found");
+
+        note.with_document_async(|doc| {
+            use automerge::transaction::Transactable;
+            let mut tx = doc.transaction();
+            tx.put(automerge::ROOT, "status", "done").unwrap();
+            tx.commit();
+        })
+        .await
+        .unwrap();
+
+        // The relay announces nothing, so this arrives only because the phone
+        // asked for the document.
+        for _ in 0..100 {
+            if value_of(&on_phone, "status").await.as_deref() == Some("done") {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the laptop's edit never reached the phone");
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_connection_is_closed_when_its_token_expires(pool: PgPool) {
+        use futures::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (base, _) = relay(&pool).await;
+        let exp = jsonwebtoken::get_current_timestamp() + 2;
+        let token = TokenSpec::default().claim("exp", json!(exp)).sign();
+        let (mut socket, _) = tokio_tungstenite::connect_async(sync_url(&base, &token))
+            .await
+            .unwrap();
+
+        let opened = std::time::Instant::now();
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(Message::Close(frame))) => return frame,
+                    Some(Ok(_)) => continue,
+                    other => panic!("ended without a close frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("still open long after the token expired")
+        .expect("a close frame with a reason");
+
+        assert_eq!(u16::from(closed.code), 1008);
+        assert_eq!(closed.reason.as_str(), "token expired");
+        // Not closed early: it stayed open until `exp`.
+        assert!(opened.elapsed() >= std::time::Duration::from_millis(900));
     }
 }
