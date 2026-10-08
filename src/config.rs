@@ -28,6 +28,24 @@ pub struct Config {
     /// which is the point: running without a membership gate is a decision
     /// someone has to write down.
     pub require_auth: bool,
+
+    /// What the token verifier needs. Present exactly when `require_auth` is
+    /// on, so a gated relay cannot start half configured.
+    pub auth: Option<AuthConfig>,
+}
+
+pub struct AuthConfig {
+    /// The `iss` every token must carry: the issuer's public URL.
+    pub oidc_issuer: String,
+
+    /// Where to fetch the issuer's signing keys. Separate from the issuer
+    /// because the relay reaches it over the internal network, not the public
+    /// name.
+    pub oidc_jwks_url: String,
+
+    /// The `aud` a sync token must carry: this relay's public sync URL,
+    /// spelled exactly as the issuer spells it.
+    pub sync_audience: String,
 }
 
 impl Config {
@@ -44,11 +62,36 @@ impl Config {
             Err(_) => true,
         };
 
+        let auth = if require_auth {
+            Some(AuthConfig {
+                oidc_issuer: required_for_auth("OIDC_ISSUER")?,
+                oidc_jwks_url: required_for_auth("OIDC_JWKS_URL")?,
+                sync_audience: required_for_auth("SYNC_AUDIENCE")?,
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             database_url,
             bind,
             require_auth,
+            auth,
         })
+    }
+}
+
+/// A setting the gated relay cannot run without. Blank counts as missing: an
+/// empty audience or issuer would be compared against tokens as if it meant
+/// something.
+fn required_for_auth(name: &str) -> Result<String> {
+    match var(name) {
+        Ok(v) if !v.trim().is_empty() => Ok(v.trim().to_string()),
+        _ => anyhow::bail!(
+            "{PREFIX}{name} must be set when {PREFIX}REQUIRE_AUTH is on. Set \
+             {PREFIX}REQUIRE_AUTH=false to run the unauthenticated relay, and \
+             only where it has no route in."
+        ),
     }
 }
 

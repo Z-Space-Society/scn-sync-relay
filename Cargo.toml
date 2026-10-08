@@ -16,6 +16,16 @@ sqlx = { version = "0.9", default-features = false, features = [
     "tls-rustls",
     "postgres",
 ] }
+# Pure-Rust crypto for token checks, and ring for TLS (the provider sqlx already
+# builds), so the deploy's cold build needs no second C crypto library.
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls-no-provider",
+    "json",
+] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
