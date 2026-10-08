@@ -20,6 +20,7 @@ when you are not.
 - Sharing a vault between members. Each vault has one owner.
 - ATProto service-auth verification. The verifier seam keeps room for it.
 - Deleting notes through MCP.
+- Renaming or deleting a vault. Vaults are created and listed only.
 - A server-side markdown exporter. The `.md` files are written by the plugin
   on each device.
 - Removing a deleted note's stored document. See Z4.
@@ -161,9 +162,10 @@ CREATE TABLE doc_creators (
 );
 ```
 
-`doc_creators` is written in two places: by the inbound filter the first
-time an authenticated peer sends a frame for an unknown document ID, and by
-the MCP `create_note` tool. The write is
+`doc_creators` is written in three places: by the inbound filter the first
+time an authenticated peer sends a frame for an unknown document ID, by
+the MCP `create_note` tool, and by vault creation (Z3), which records the
+vault's owner as creator of its root document. The write is
 `INSERT ... ON CONFLICT DO NOTHING`, then read back, so two peers racing on
 one ID cannot both become its creator.
 
@@ -179,16 +181,26 @@ audience.
 
 | Endpoint | Caller | Does |
 |---|---|---|
-| `POST /vaults` `{root_doc_id, name}` | member | Registers a vault owned by the caller. Requires that `doc_creators` names the caller as creator of `root_doc_id` and that the document is not already in a vault. `409` otherwise. |
-| `GET /vaults` | member | Lists the caller's vaults. |
-| `GET /internal/vaults?did=<did>` | Corliss | Lists a member's vaults: name, created, last change. Authenticated with a shared service credential. |
+| `GET /vaults` | member | Lists the caller's vaults: root document ID, name, created, last change. A sync client uses this to choose which vault to connect to. |
+| `GET /internal/vaults?did=<did>` | Corliss | Lists a member's vaults, same fields. |
+| `POST /internal/vaults` `{did, name}` | Corliss | Creates a vault owned by `did`. The relay creates an empty root folder document, records `did` as its creator in `doc_creators`, inserts the `vaults` row, and returns the new vault. `409` if the member already has a vault with that name. |
 
-The `/internal/` prefix exists so the reverse proxy can leave it unrouted.
-It is reachable only on the internal network.
+Both `/internal/` endpoints are authenticated with the shared service
+credential. The prefix exists so the reverse proxy can leave it unrouted;
+it is reachable only on the internal network.
 
-A client registers a vault after its root document's first sync frame has
-reached the relay. Until then `POST /vaults` answers `409`, and the client
-retries.
+**Vaults are created only here.** No sync client creates or registers a
+vault. A client lists the member's vaults, the user picks one, and the
+client requests that root document. A member may have any number of
+vaults.
+
+Names: 1 to 100 characters after trimming, unique per owner, compared
+without regard to case. MCP tools address a note by vault and path, so two
+vaults with one name would be ambiguous.
+
+The relay does not check membership on create. Corliss calls it only for a
+signed-in member, and a vault whose owner cannot get a token is
+unreachable.
 
 Last change comes from `DocHandle::changes` on the vault's documents. It is
 held in memory and written to `vaults.last_change_at` at most once a minute
@@ -201,7 +213,7 @@ folder documents. Folder documents list entries shaped `{name, type, url}`.
 
 - Held in memory: `doc_id -> root_doc_id`.
 - Built at startup for every row in `vaults`, and when a vault is
-  registered.
+  created.
 - Rebuilt for a vault when any of its folder documents changes
   (`DocHandle::changes`), at most once a second per vault. A first import
   changes folder documents thousands of times.
@@ -339,7 +351,7 @@ All prefixed `SCN_SYNC_RELAY_`.
 | `SYNC_AUDIENCE` | required when auth is on | Public sync URL |
 | `MCP_BIND` | `0.0.0.0:7031` | MCP listener |
 | `MCP_AUDIENCE` | required when auth is on | Public MCP URL in canonical form: lowercase scheme and host, no trailing slash, no default port. Also the `resource` value and the source of `allowed_hosts`. |
-| `SERVICE_TOKEN` | required when auth is on | Shared credential for `/internal/vaults` |
+| `SERVICE_TOKEN` | required when auth is on | Shared credential for `/internal/vaults`, list and create |
 
 `/health` keeps reporting the auth mode, which becomes `corliss` when the
 verifier is active.
@@ -353,7 +365,7 @@ verifier is active.
 | `src/reach.rs` | Reachability index and the folder document walk |
 | `src/wire.rs` | CBOR envelope reader, `doc-unavailable` writer |
 | `src/filter.rs` | Transport filter and expiry |
-| `src/vaults.rs` | `/vaults` and `/internal/vaults` handlers |
+| `src/vaults.rs` | `/vaults` and `/internal/vaults` handlers, vault creation |
 | `src/mcp/` | Server setup, auth middleware, tools, search |
 | `src/config.rs` | New settings |
 | `src/main.rs` | Wiring, two listeners |
@@ -372,6 +384,10 @@ Unit tests:
   the note's first frame is admitted once the creator row is written.
 - `auth`: good token, expired, wrong audience, wrong issuer, unknown `kid`
   triggering one refetch.
+- `vaults`: create returns a vault whose root document the owner can open
+  and no one else can; a duplicate name for one owner is `409`; the same
+  name for two owners is allowed; a missing or wrong service credential is
+  refused.
 
 Integration tests, with a second samod repo acting as the client against the
 relay's router:
@@ -383,7 +399,7 @@ relay's router:
 | 3. A connection closes at token expiry | Short-lived token, assert the socket closes |
 | 4. An MCP client can list, read, search and edit | Tool calls over Streamable HTTP |
 | 5. An MCP edit reaches a sync client and a sync edit is visible to MCP | One client connected, edit each way |
-| 6. A restart loses nothing, including vault records | Rebuild the app on the same database |
+| 6. A restart loses nothing, including vault records | Create a vault through `/internal/vaults`, rebuild the app on the same database, list it |
 
 Checks 4 and 5 against real MCP clients and Obsidian on iOS with the
 scn-obsidian plugin are verified on the deployed relay, not in this repo's
@@ -393,8 +409,10 @@ tests.
 
 1. **Folder and note document schema.** The entry shape `{name, type, url}`
    is fixed. The key that holds the entries, and the key that holds a note's
-   text, are settled in the scn-obsidian plugin spec, because the plugin
-   writes them, and then copied here. `reach.rs` and the tools wait on that.
+   text, are settled in the scn-obsidian plugin spec and then copied here.
+   The relay now writes this schema as well as reading it: vault creation
+   writes an empty root folder document, and `create_note` writes notes and
+   entries. `reach.rs`, vault creation and the tools wait on that.
 2. **Client reaction to `doc-unavailable` on a denied push.** Not verified
    against the JS client. It decides whether a denied write fails quietly or
    surfaces an error.
@@ -423,6 +441,9 @@ tests.
    reconnect. If the cost is too high, the candidates are a longer sync token
    lifetime or renewing a token on an open connection. Neither is designed
    here.
+8. **A cap on vaults per member.** None in this spec. Each vault costs one
+   small document and one row, so the risk is clutter, not load. Add a cap
+   if it becomes a problem.
 
 ## Rollout
 
