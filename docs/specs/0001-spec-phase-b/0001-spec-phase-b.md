@@ -74,6 +74,35 @@ each connection's transport, described below.
 rmcp needs Rust 1.88. `rust-version` in `Cargo.toml` is already 1.94, set by
 sqlx 0.9.
 
+## Document schema
+
+Settled in the scn-obsidian plugin spec, sections D1 to D5, and repeated
+here.
+
+- A folder document is `{"@patchwork": {"type": "folder"}, "title", "docs"}`.
+  `docs` is a list of entries `{name, type, url}`.
+- A note document is `{"@patchwork": {"type": "file"}, "name", "extension":
+  "md", "mimeType": "text/markdown", "content"}`. `content` is an Automerge
+  text object holding the file's text exactly.
+- An entry's `type` is `folder`, or the file's extension. The relay acts on
+  `folder` and `md` and ignores every other entry: it does not walk it,
+  list it, search it or admit it to a vault's reachable set.
+- A name is one path segment: not empty, not `.` or `..`, no `/`, no
+  leading dot, stored in NFC. `create_note` refuses any other name, and
+  refuses a name that collides with an existing entry after NFC and case
+  folding.
+- **Path resolution with duplicate names.** When a folder holds two entries
+  whose names collide, the entry whose `url` sorts lowest as a string is
+  the one the path refers to. Clients rename the others; see the plugin
+  spec, T4.
+- Vault creation writes a root folder document with `title` set to the
+  vault's name and an empty `docs` list.
+- `create_note` writes the note document first, then appends the entry.
+  `edit_note` and `append_note` splice `content` and never replace it.
+- Text positions are computed in whatever unit the relay's Automerge build
+  uses, by the relay, on the document it holds. No position crosses the
+  wire.
+
 ## Authentication
 
 ### A1. Corliss token verifier
@@ -185,8 +214,24 @@ audience.
 | `GET /internal/vaults?did=<did>` | Corliss | Lists a member's vaults, same fields. |
 | `POST /internal/vaults` `{did, name}` | Corliss | Creates a vault owned by `did`. The relay creates an empty root folder document, records `did` as its creator in `doc_creators`, inserts the `vaults` row, and returns the new vault. `409` if the member already has a vault with that name. |
 
+A vault in every response is one JSON object:
+
+```json
+{
+  "root_doc_id": "<document ID>",
+  "url": "automerge:<document ID>",
+  "name": "<vault name>",
+  "created_at": "<RFC 3339 timestamp>",
+  "last_change_at": "<RFC 3339 timestamp, or null>"
+}
+```
+
+Both list endpoints return `200` with `{"vaults": [...]}`, oldest first, and
+an empty list for a member with none. Create returns `201` with the vault
+object.
+
 Both `/internal/` endpoints are authenticated with the shared service
-credential. The prefix exists so the reverse proxy can leave it unrouted;
+credential, sent as `Authorization: Bearer <SERVICE_TOKEN>`. The prefix exists so the reverse proxy can leave it unrouted;
 it is reachable only on the internal network.
 
 **Vaults are created only here.** No sync client creates or registers a
@@ -407,12 +452,7 @@ tests.
 
 ## Open questions
 
-1. **Folder and note document schema.** The entry shape `{name, type, url}`
-   is fixed. The key that holds the entries, and the key that holds a note's
-   text, are settled in the scn-obsidian plugin spec and then copied here.
-   The relay now writes this schema as well as reading it: vault creation
-   writes an empty root folder document, and `create_note` writes notes and
-   entries. `reach.rs`, vault creation and the tools wait on that.
+1. Settled. See "Document schema".
 2. **Client reaction to `doc-unavailable` on a denied push.** Not verified
    against the JS client. It decides whether a denied write fails quietly or
    surfaces an error.
