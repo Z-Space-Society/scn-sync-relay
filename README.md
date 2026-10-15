@@ -82,6 +82,7 @@ On the sync listener (`BIND`):
 | `GET /vaults` | member | The caller's vaults. `Authorization: Bearer` with a sync token. |
 | `GET /internal/vaults?did=` | Corliss | A member's vaults. `Authorization: Bearer` with the service token. |
 | `POST /internal/vaults` | Corliss | Create a vault: `{"did", "name"}`. Returns `201` and the vault. |
+| `GET /.well-known/oauth-protected-resource` | anyone | Which authorization server issues sync tokens: `resource` is `SYNC_AUDIENCE`, `authorization_servers` is the issuer. A sync client given only the sync URL finds Corliss here. Not served with auth off. |
 | `GET /health` | anyone | Liveness and the current auth mode. Does not touch Postgres, so a database blip cannot get the relay restarted out from under live connections. |
 
 On the MCP listener (`MCP_BIND`):

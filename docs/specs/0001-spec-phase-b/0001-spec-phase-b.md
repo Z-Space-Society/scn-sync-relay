@@ -238,6 +238,12 @@ Errors on the `/internal/` endpoints are `{"error": "<code>"}`: `400` with
 `invalid_did` or `invalid_name`, `409` with `name_taken`. A missing or wrong
 credential on any of the three is `401` with no JSON body.
 
+The sync listener also serves `GET /.well-known/oauth-protected-resource`,
+unauthenticated: `resource` is the sync audience, `authorization_servers` is
+the issuer, and `bearer_methods_supported` is `header` and `query`. A sync
+client given only the sync URL finds the issuer there. Added in v0.2.1 at the
+scn-obsidian plugin spec's request. Not served with `REQUIRE_AUTH=false`.
+
 Both `/internal/` endpoints are authenticated with the shared service
 credential, sent as `Authorization: Bearer <SERVICE_TOKEN>`. The prefix exists so the reverse proxy can leave it unrouted;
 it is reachable only on the internal network.

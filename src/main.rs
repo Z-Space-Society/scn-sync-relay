@@ -24,9 +24,9 @@ use axum::{
         Query, State,
     },
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::get,
-    Router,
+    Json, Router,
 };
 use samod::{AcceptorHandle, NeverAnnounce, Repo};
 use serde::Deserialize;
@@ -43,6 +43,9 @@ struct AppState {
     verifier: Arc<dyn DidVerifier>,
     /// The audience a sync token must carry. Empty when nothing is verified.
     sync_audience: Arc<str>,
+    /// Who issues sync tokens, for the resource metadata. `None` with no
+    /// verifier, where there is no issuer to name.
+    oidc_issuer: Option<Arc<str>>,
     authz: Authz,
     /// Whether connections go through the filter. Off only with no verifier,
     /// where there is no DID to decide by.
@@ -109,6 +112,7 @@ async fn main() -> Result<()> {
             .map(|auth| auth.sync_audience.as_str())
             .unwrap_or_default()
             .into(),
+        oidc_issuer: config.auth.as_ref().map(|auth| auth.oidc_issuer.as_str().into()),
         authz: authz.clone(),
         enforce: config.require_auth,
         service_token: config.service_token.as_deref().map(Arc::from),
@@ -166,6 +170,7 @@ fn router(state: AppState) -> Router {
         .route("/sync", get(sync))
         .route("/health", get(health))
         .route("/vaults", get(vaults::list_own))
+        .route("/.well-known/oauth-protected-resource", get(sync_metadata))
         .route(
             "/internal/vaults",
             get(vaults::list_for_member).post(vaults::create),
@@ -192,6 +197,24 @@ async fn build_verifier(config: &Config) -> Result<Arc<dyn DidVerifier>> {
 /// the relay restarted out from under live connections.
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, format!("ok auth={}\n", state.verifier.name()))
+}
+
+/// RFC 9728 protected resource metadata for the sync resource: which
+/// authorization server issues its tokens. A sync client given only the sync
+/// URL finds Corliss from here, so a member pastes one address, not two.
+///
+/// The token goes in the query string on the websocket, where a browser or
+/// phone cannot set a header, and in the header on `/vaults`.
+async fn sync_metadata(State(state): State<AppState>) -> Response {
+    match &state.oidc_issuer {
+        Some(issuer) => Json(serde_json::json!({
+            "resource": &*state.sync_audience,
+            "authorization_servers": [&**issuer],
+            "bearer_methods_supported": ["header", "query"],
+        }))
+        .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -309,6 +332,7 @@ mod tests {
             acceptor,
             verifier: Arc::clone(&verifier),
             sync_audience: SYNC_AUDIENCE.into(),
+            oidc_issuer: Some(auth::tests::ISSUER.into()),
             authz: authz.clone(),
             enforce: true,
             service_token: Some(SERVICE_TOKEN.into()),
@@ -788,6 +812,21 @@ mod tests {
         let metadata: Value = reqwest::get(&metadata_url).await.unwrap().json().await.unwrap();
         assert_eq!(metadata["resource"], relay.mcp);
         assert_eq!(metadata["authorization_servers"], json!([auth::tests::ISSUER]));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn the_sync_listener_names_its_issuer(pool: PgPool) {
+        let relay = start(&pool).await;
+        let metadata: Value =
+            reqwest::get(format!("{}/.well-known/oauth-protected-resource", relay.base))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(metadata["resource"], SYNC_AUDIENCE);
+        assert_eq!(metadata["authorization_servers"], json!([auth::tests::ISSUER]));
+        assert_eq!(metadata["bearer_methods_supported"], json!(["header", "query"]));
     }
 
     #[sqlx::test(migrations = false)]
