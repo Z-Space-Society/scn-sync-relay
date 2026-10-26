@@ -45,6 +45,12 @@ pub struct Vault {
     pub name: String,
     pub created_at: DateTime<Utc>,
     pub last_change_at: Option<DateTime<Utc>>,
+    /// Null until the relay has walked the vault since it started.
+    pub note_count: Option<usize>,
+    /// Bytes the vault's documents take in storage: Automerge history, not
+    /// the size of the notes as files. Filled by [`Authz::add_sizes`] only,
+    /// so the MCP tools, which list vaults on every call, never pay for it.
+    pub bytes: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -185,19 +191,45 @@ impl Authz {
         let mut vaults = Vec::with_capacity(rows.len());
         for row in rows {
             let root: String = row.try_get("root_doc_id")?;
+            let id = DocumentId::from_str(&root).ok();
             // Memory is ahead of the table by up to a minute.
-            let in_memory = DocumentId::from_str(&root)
-                .ok()
-                .and_then(|id| reach.last_change(&id));
+            let in_memory = id.as_ref().and_then(|id| reach.last_change(id));
             vaults.push(Vault {
                 url: format!("automerge:{root}"),
+                note_count: id.as_ref().and_then(|id| reach.note_count(id)),
                 root_doc_id: root,
                 name: row.try_get("name")?,
                 created_at: row.try_get("created_at")?,
                 last_change_at: in_memory.or(row.try_get("last_change_at")?),
+                bytes: None,
             });
         }
         Ok(vaults)
+    }
+
+    /// Fill in `bytes` for vaults that have been walked.
+    pub async fn add_sizes(&self, vaults: &mut [Vault]) -> Result<()> {
+        for vault in vaults {
+            let docs = DocumentId::from_str(&vault.root_doc_id)
+                .ok()
+                .and_then(|root| self.0.reach.read().unwrap().docs_of(&root));
+            let Some(docs) = docs else { continue };
+            let docs: Vec<String> = docs.iter().map(ToString::to_string).collect();
+            // A document's rows are the keys from `<id>/` up to `<id>0`, `0`
+            // being the character after `/`. The `~>=~` and `~<~` operators
+            // are the ones `text_pattern_ops` serves, so this is one index
+            // range per document; a `LIKE` on a joined value would scan.
+            let size: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(octet_length(s.value)), 0)::BIGINT
+                 FROM unnest($1::TEXT[]) AS d(id)
+                 JOIN storage s ON s.key ~>=~ (d.id || '/') AND s.key ~<~ (d.id || '0')",
+            )
+            .bind(&docs)
+            .fetch_one(&self.0.pool)
+            .await?;
+            vault.bytes = Some(size);
+        }
+        Ok(())
     }
 
     /// Create a vault for a member: an empty root folder document and its row.
@@ -260,6 +292,8 @@ impl Authz {
             name: name.to_string(),
             created_at,
             last_change_at: None,
+            note_count: None,
+            bytes: None,
         })
     }
 }
@@ -566,6 +600,48 @@ pub(crate) mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("last change was never set");
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_walked_vault_has_a_note_count_and_a_size(pool: PgPool) {
+        let (authz, repo) = open(&pool).await;
+        let alice = did("alice");
+        let (root, root_doc) = vault(&authz, &repo, &alice, "Notes").await;
+
+        let mut notes = Vec::new();
+        for name in ["a.md", "b.md"] {
+            let note = sent(&authz, &repo, &alice, Automerge::new()).await;
+            link(&root_doc, name, "md", note.document_id()).await;
+            notes.push(note.document_id().clone());
+        }
+        // Alice's own, but linked from nowhere: in no vault's total.
+        sent(&authz, &repo, &alice, Automerge::new()).await;
+        eventually("both notes are in the vault", || {
+            notes
+                .iter()
+                .all(|note| authz.vault_of(note) == Some(root.clone()))
+        })
+        .await;
+
+        let mut vaults = authz.list_vaults(&alice).await.unwrap();
+        assert_eq!(vaults[0].note_count, Some(2));
+        assert_eq!(vaults[0].bytes, None, "only add_sizes fills it");
+
+        let mut expected = 0;
+        for doc in [&root].into_iter().chain(&notes) {
+            let doc_bytes: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(octet_length(value)), 0)::BIGINT
+                 FROM storage WHERE key LIKE $1 || '/%'",
+            )
+            .bind(doc.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(doc_bytes > 0, "{doc} has nothing in storage");
+            expected += doc_bytes;
+        }
+        authz.add_sizes(&mut vaults).await.unwrap();
+        assert_eq!(vaults[0].bytes, Some(expected));
     }
 
     #[sqlx::test(migrations = false)]

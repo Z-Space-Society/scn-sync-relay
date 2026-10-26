@@ -63,6 +63,9 @@ struct VaultReach {
     /// One task per reachable document, listening for changes.
     watchers: HashMap<DocumentId, JoinHandle<()>>,
     load_retries: u8,
+    /// How many notes the last walk found. `None` until the first walk, when
+    /// `docs` holds only the root and would understate the vault.
+    notes: Option<usize>,
     last_change: Option<DateTime<Utc>>,
     /// `last_change` is newer than the table.
     unsaved: bool,
@@ -82,6 +85,17 @@ impl Index {
 
     pub(crate) fn last_change(&self, root: &DocumentId) -> Option<DateTime<Utc>> {
         self.vaults.get(root)?.last_change
+    }
+
+    pub(crate) fn note_count(&self, root: &DocumentId) -> Option<usize> {
+        self.vaults.get(root)?.notes
+    }
+
+    /// Every document in a vault, once it has been walked.
+    pub(crate) fn docs_of(&self, root: &DocumentId) -> Option<Vec<DocumentId>> {
+        let vault = self.vaults.get(root)?;
+        vault.notes?;
+        Some(vault.docs.iter().cloned().collect())
     }
 
     /// A creator has just been recorded: rebuild any vault that was waiting to
@@ -203,6 +217,7 @@ impl Authz {
                     wake: Arc::clone(&wake),
                     watchers: HashMap::new(),
                     load_retries: 0,
+                    notes: None,
                     last_change,
                     unsaved: false,
                 },
@@ -318,6 +333,7 @@ impl Authz {
                 tokio::spawn(self.clone().watch(root.clone(), handle, changes, true))
             });
         }
+        vault.notes = Some(notes.len());
         for note in notes {
             vault
                 .watchers
