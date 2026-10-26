@@ -52,8 +52,12 @@ fn is_service(state: &AppState, headers: &HeaderMap) -> bool {
 }
 
 async fn list(state: &AppState, did: &Did) -> Response {
-    match state.authz.list_vaults(did).await {
-        Ok(vaults) => Json(json!({ "vaults": vaults })).into_response(),
+    let mut vaults = match state.authz.list_vaults(did).await {
+        Ok(vaults) => vaults,
+        Err(e) => return internal_error(e),
+    };
+    match state.authz.add_sizes(&mut vaults).await {
+        Ok(()) => Json(json!({ "vaults": vaults })).into_response(),
         Err(e) => internal_error(e),
     }
 }

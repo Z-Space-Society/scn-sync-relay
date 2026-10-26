@@ -122,9 +122,17 @@ A vault is one JSON object:
   "url": "automerge:<document ID>",
   "name": "<vault name>",
   "created_at": "<RFC 3339 timestamp>",
-  "last_change_at": "<RFC 3339 timestamp, or null>"
+  "last_change_at": "<RFC 3339 timestamp, or null>",
+  "note_count": "<integer, or null>",
+  "bytes": "<integer, or null>"
 }
 ```
+
+`note_count` and `bytes` are null until the relay has walked the vault
+since it started, and `bytes` is filled in by the listing endpoints only:
+the MCP tools list vaults on every call and do not pay for the query. It is
+the bytes the vault's documents take in storage, which is their Automerge
+history. It grows with every edit and reads larger than the notes as files.
 
 Listings return `{"vaults": [...]}`, oldest first. Errors on the internal
 endpoints are `{"error": "<code>"}`: `400` with `invalid_did` or
@@ -188,6 +196,30 @@ trips as `Display` out and `split('/')` back, with no escaping.
 `text_pattern_ops` is load-bearing: the default opclass follows the database
 collation and will not serve a `LIKE 'prefix%'` scan, which would quietly turn
 every range read into a full scan of a table that only grows.
+
+### Inspecting storage
+
+A vault's `bytes` is the one per-vault figure: only the relay's index knows
+which documents a vault holds, so SQL alone cannot split `storage` by vault.
+These answer the rest, in `psql` against the relay's database.
+
+```sql
+-- The database and the storage table, on disk.
+SELECT pg_size_pretty(pg_database_size(current_database())),
+       pg_size_pretty(pg_total_relation_size('storage'));
+
+-- Snapshot and incremental rows: many incrementals means not yet compacted.
+SELECT split_part(key, '/', 2) AS kind, count(*),
+       pg_size_pretty(sum(octet_length(value)))
+FROM storage GROUP BY 1;
+
+-- Documents nobody is recorded as sending: open to nobody, in no vault.
+-- This is how leftovers get spotted.
+SELECT split_part(key, '/', 1) AS doc, sum(octet_length(value)) AS bytes
+FROM storage
+WHERE split_part(key, '/', 1) NOT IN (SELECT doc_id FROM doc_creators)
+GROUP BY 1 ORDER BY 2 DESC;
+```
 
 ## Building
 
